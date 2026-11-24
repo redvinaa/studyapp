@@ -1,0 +1,27 @@
+services:
+  backend:
+    build: ./backend
+    env_file: .env
+    volumes:
+      - app_data:/data
+      - embedding_cache:/models
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "127.0.0.1:8788:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:0.6.8
+    profiles: [local]
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+volumes:
+  app_data:
+  embedding_cache:
+  ollama_models:
