@@ -57,12 +57,17 @@ def _make(sub, recent):
             f"The subject name may already be visible, so do not ask the learner to guess the subject name. "
             f"Both front and back may use Markdown, tables, code and LaTeX. Give a self-contained answer with reasoning where needed. "
             f"Avoid these recent questions: {json.dumps(recent[-10:])}. Before responding, check whether the front reveals the answer; "
-            f"rewrite it if so. Return JSON only: {{\"front\":\"...\",\"back\":\"...\",\"answer_leaked\":false,\"source_chunk_ids\":[1]}}. "
+            f"rewrite it if so. Return JSON only: {{\"front\":\"...\",\"back\":\"...\",\"answer_leaked\":false,\"source_chunk_ids\":[]}}. "
+            f"The citation array must contain at least one integer ID copied from this exact set: {json.dumps([r['id'] for r in selected])}. "
+            f"Never use an ID outside that set; the example array is empty only to show the format. "
             f"If evidence is insufficient return {{\"error\":\"insufficient_context\"}}.\n\nEXCERPTS:\n{excerpts}")
-    for attempt in range(2):
-        obj=generate(prompt)
+    for attempt in range(3):
+        try:
+            obj=generate(prompt+('\nThe prior response was invalid. Check that every source_chunk_id is in the provided set, the front is standalone and does not reveal the answer.' if attempt else ''))
+        except ValueError:
+            continue
         ids=obj.get('source_chunk_ids'); front=obj.get('front'); back=obj.get('back')
-        if obj.get('error'): raise ValueError('The source material did not provide enough context for a question. Try again.')
+        if obj.get('error'): continue
         if obj.get('answer_leaked') is False and isinstance(front,str) and front.strip() and not _SOURCE_REFERENCE.search(front) and isinstance(back,str) and back.strip() and isinstance(ids,list) and ids and all(isinstance(i,int) and i in {r['id'] for r in selected} for i in ids):
             sources=[]
             for r in selected:

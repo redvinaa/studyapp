@@ -302,3 +302,32 @@ def test_deleting_topic_drops_prefetched_cards():
             study.prefetched[999999]={'topic_id':topic,'revision':1,'queue':[{'front':'old'}],'recent':[],'error':None,'retry_at':0}
         assert c.delete('/api/topics/'+str(topic)).status_code==200
         with study.lock: assert 999999 not in study.prefetched
+
+
+def test_card_retries_invalid_citation_id(monkeypatch):
+    from app import study
+    from app.db import db
+    import threading,re
+    calls=[]
+    def responses(prompt):
+        allowed=[int(x) for x in re.findall(r'\[chunk (\d+)\]',prompt)]
+        if threading.current_thread() is threading.main_thread():
+            calls.append(prompt)
+            ids=[999999] if len(calls)==1 else [allowed[0]]
+        else: ids=[allowed[0]]
+        return {'front':'How is motion described?', 'back':'As a change in position.', 'answer_leaked':False, 'source_chunk_ids':ids}
+    monkeypatch.setattr(study,'generate',responses)
+    monkeypatch.setattr(study,'prewarm',lambda:None)
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Citation check'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Motion'}).json()['id']
+        c.post(f'/api/topics/{topic}/files',files={'files':('test.txt',b'Motion is change in position over time.','text/plain')})
+        for _ in range(100):
+            t=next(x for x in c.get('/api/tree').json() if x['id']==course)['topics'][0]
+            if t['index_status'] in ('ready','error'):break
+            time.sleep(.05)
+        with db() as con: sub=study.eligible(con,'topic',topic)[0]
+        card=study._make(sub,[])
+        assert len(calls)==2 and card['sources']
+        assert 'copied from this exact set' in calls[0]
