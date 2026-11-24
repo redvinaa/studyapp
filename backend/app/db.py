@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, topic_id INTEGER NOT NU
 CREATE INDEX IF NOT EXISTS files_topic ON files(topic_id);
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, content TEXT NOT NULL, page_start INTEGER, page_end INTEGER, line_start INTEGER, line_end INTEGER, embedding BLOB NOT NULL, embedding_model TEXT NOT NULL, UNIQUE(file_id,ordinal));
 CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
-CREATE TABLE IF NOT EXISTS subtopics(id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT NOT NULL, proficiency REAL NOT NULL DEFAULT 0.5 CHECK(proficiency BETWEEN 0 AND 1), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS subtopics(id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT NOT NULL, proficiency REAL NOT NULL DEFAULT 0.0 CHECK(proficiency BETWEEN 0 AND 1), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS subtopics_topic ON subtopics(topic_id);
 CREATE TABLE IF NOT EXISTS failed_cards(id INTEGER PRIMARY KEY, subtopic_id INTEGER NOT NULL REFERENCES subtopics(id) ON DELETE CASCADE, question_type TEXT NOT NULL, front TEXT NOT NULL, back TEXT NOT NULL, sources_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS failed_subtopic ON failed_cards(subtopic_id);
@@ -42,3 +42,8 @@ CREATE TABLE IF NOT EXISTS material_generations(id INTEGER PRIMARY KEY, topic_id
 CREATE INDEX IF NOT EXISTS generations_topic ON material_generations(topic_id);
 
 ''')
+        columns = {row['name'] for row in c.execute('PRAGMA table_info(material_generations)')}
+        if 'concept_scope' not in columns:
+            c.execute('ALTER TABLE material_generations ADD COLUMN concept_scope TEXT')
+        if 'concept_name' not in columns:
+            c.execute('ALTER TABLE material_generations ADD COLUMN concept_name TEXT')

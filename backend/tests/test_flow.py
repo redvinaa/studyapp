@@ -35,7 +35,7 @@ def test_complete_flow():
             if t['index_status'] in ('ready','error'): break
             time.sleep(.05)
         assert t['index_status']=='ready',t
-        assert t['proficiency']==.5 and len(t['subtopics'])==1
+        assert t['proficiency']==0 and len(t['subtopics'])==1
         sid=c.post('/api/sessions',json={'scope_type':'course','scope_id':course}).json()['id']
         for _ in range(100):
             card=c.get(f'/api/sessions/{sid}/next')
@@ -44,10 +44,10 @@ def test_complete_flow():
         assert card.status_code==200,card.text
         card=card.json(); token=card['card_token']
         grade=c.post(f'/api/sessions/{sid}/grade',json={'card_token':token,'known':False})
-        assert grade.status_code==200 and abs(grade.json()['proficiency']-.4)<1e-8
+        assert grade.status_code==200 and grade.json()['proficiency']==0
         repeat=c.post(f'/api/sessions/{sid}/grade',json={'card_token':token,'known':False})
         assert repeat.json()==grade.json()
-        assert abs(c.get('/api/tree').json()[0]['proficiency']-.4)<1e-8
+        assert c.get('/api/tree').json()[0]['proficiency']==0
         assert c.delete('/api/files/'+str(upload.json()['files'][0]['id'])).status_code==200
         assert c.get('/api/files/'+str(upload.json()['files'][0]['id'])).status_code==404
 
@@ -95,3 +95,30 @@ def test_generation_failure_and_retry(monkeypatch):
             if t['files'] and t['index_status']=='ready':break
             time.sleep(.05)
         assert t['index_status']=='ready' and len(t['files'])==1
+
+
+def test_focused_description_stays_one_subtopic(monkeypatch):
+    from app import material
+    monkeypatch.setattr(material, 'generate', lambda prompt: {'material':'Bloom filters use bit arrays. They can have false positives. Variants include counting Bloom filters.', 'focus':{'scope':'single','name':'Bloom filters'}})
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Focused course'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Storage'}).json()['id']
+        result=c.post(f'/api/topics/{topic}/generate-material',json={'description':'bloom filters'})
+        assert result.status_code==202
+        for _ in range(200):
+            t=next(x for x in c.get('/api/tree').json() if x['id']==course)['topics'][0]
+            if t['files'] and t['index_status'] in ('ready','error'): break
+            time.sleep(.05)
+        assert t['index_status']=='ready',t
+        assert [s['name'] for s in t['subtopics']]==['Bloom filters']
+        assert t['subtopics'][0]['proficiency']==0
+        sid=c.post('/api/sessions',json={'scope_type':'topic','scope_id':topic}).json()['id']
+        for _ in range(100):
+            card=c.get(f'/api/sessions/{sid}/next')
+            if card.status_code!=202: break
+            time.sleep(.05)
+        assert card.status_code==200,card.text
+        token=card.json()['card_token']
+        grade=c.post(f'/api/sessions/{sid}/grade',json={'card_token':token,'known':True})
+        assert abs(grade.json()['proficiency']-.2)<1e-8
