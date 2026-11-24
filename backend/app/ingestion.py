@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import fitz
 from .db import db, UPLOADS
 from .ai import embeddings, generate, MODEL
+from .source_files import generated_filename, generated_reference
 
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='index')
 _pending = set()
@@ -45,7 +46,10 @@ def extract(file):
         if not units: raise ValueError('No text found in PDF. Scanned PDFs require OCR, which is not supported.')
     else:
         try:
-            with open(path, encoding='utf-8-sig') as f: lines = f.read().splitlines()
+            with open(path, encoding='utf-8-sig') as f: text = f.read()
+            if file.get('generated_description'):
+                text=generated_reference(text,file['generated_description'],generated_filename(file['original_name'],file['generated_description'],file.get('requested_name'),file.get('concept_name')))
+            lines=text.splitlines()
         except UnicodeDecodeError: raise ValueError('Text files must use UTF-8 encoding.')
         if not any(line.strip() for line in lines): raise ValueError('The file contains no text.')
         for start in range(0,len(lines),24):
@@ -67,7 +71,7 @@ def _run(topic_id):
                 if not jobs: break
                 c.execute("UPDATE ingestion_jobs SET status='running',updated_at=CURRENT_TIMESTAMP WHERE topic_id=? AND status='queued'",(topic_id,))
                 c.execute("UPDATE topics SET index_status='processing' WHERE id=?",(topic_id,))
-                files=[dict(r) for r in c.execute('SELECT * FROM files WHERE topic_id=? ORDER BY id',(topic_id,))]
+                files=[dict(r) for r in c.execute('SELECT f.*,(SELECT g.description FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS generated_description,(SELECT g.requested_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS requested_name,(SELECT g.concept_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS concept_name FROM files f WHERE f.topic_id=? ORDER BY f.id',(topic_id,))]
                 existing=[dict(r) for r in c.execute('SELECT id,name,description FROM subtopics WHERE topic_id=? AND active=1',(topic_id,))]
                 generated=[dict(r) for r in c.execute("SELECT file_id,description,concept_scope,concept_name FROM material_generations WHERE topic_id=? AND status='complete' AND file_id IS NOT NULL ORDER BY id",(topic_id,))]
             try:
@@ -146,6 +150,8 @@ def _run(topic_id):
                         c.execute("UPDATE topics SET index_status='ready',index_revision=index_revision+1,last_error=NULL WHERE id=?",(topic_id,))
                 with db() as c:
                     for job in jobs: c.execute("UPDATE ingestion_jobs SET status='complete',updated_at=CURRENT_TIMESTAMP WHERE id=?",(job,))
+                from . import study
+                study.prewarm()
             except Exception as e:
                 msg=str(e)[:300] or 'Indexing failed.'
                 with db() as c:

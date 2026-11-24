@@ -1,6 +1,6 @@
 # Study
 
-A single-user, online retrieval-practice app for PDF, Markdown, and text course material. Upload files or generate AI-written study notes from a description of what you need to learn. Generated notes are labeled and should be checked against reliable sources. Files and proficiency are stored on the host; embeddings are computed locally with FastEmbed. The configured language model creates subtopics and source-cited questions. Failed questions return until answered correctly; proficiency is an exponentially weighted self-assessment, not a spaced-repetition schedule. Progress percentages are hidden until ten answers have been graded in that scope; the counter starts when this feature is installed because older answers were not recorded.
+A single-user, online retrieval-practice app for PDF, Markdown, and text course material. Upload files or generate concise reference notes from a description of what you need to learn. Generated notes should be checked against reliable sources. Files and proficiency are stored on the host; embeddings are computed locally with FastEmbed. The configured language model creates subtopics and source-cited questions. Failed questions return until answered correctly; proficiency is an exponentially weighted self-assessment, not a spaced-repetition schedule. The progress ring shows the latest five graded answers in each scope, with known answers in green and unknown answers in red. A dash is shown until five answers have been recorded; older answers cannot be reconstructed because they were not stored.
 
 ## Run
 
@@ -14,7 +14,7 @@ Put the hash in single quotes in `.env` so Compose preserves the `$` characters.
 
 For OpenAI, explicitly set `LLM_PROVIDER=openai`, `CLOUD_ENABLED=true`, `OPENAI_API_KEY` and `LLM_MODEL`. Source excerpts, summaries and descriptions for generated notes are sent to the configured provider when indexing or generating content. Keep `.env` private and out of version control. Reindex all topics after changing embedding models. The first indexing job downloads the embedding model to the persistent model volume.
 
-The Jetson installation uses Pigeo's existing OpenAI key with GPT-6.1 Sol. The app itself binds only to loopback, with HTTPS provided by the remotely managed Cloudflare tunnel. The backend runs as one process and is not publicly exposed.
+The Jetson installation uses Pigeo's existing OpenAI key with GPT-6.1 Sol. Two cards per indexed subtopic are generated in the background and refilled when used, including before a study session begins; this consumes API credits even while you are not studying. The first fill after startup or indexing and an exhausted queue can still take time. The app itself binds only to loopback, with HTTPS provided by the remotely managed Cloudflare tunnel. The backend runs as one process and is not publicly exposed.
 
 ## Operations
 

@@ -1,11 +1,13 @@
 import hashlib, json, os, secrets, time
 from pathlib import Path
+from urllib.parse import quote
 from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import JSONResponse, FileResponse
 from argon2 import PasswordHasher
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 from .db import db, init, UPLOADS
 from . import ingestion, material, study
+from .source_files import generated_filename, generated_reference
 
 app=FastAPI()
 secret=os.environ['SESSION_SECRET']; password_hash=os.environ['PASSWORD_HASH']
@@ -15,7 +17,7 @@ MAX_BYTES=int(os.getenv('MAX_UPLOAD_MB','50'))*1024*1024
 def error(code,message,status): return JSONResponse({'error':{'code':code,'message':message}},status_code=status)
 
 @app.on_event('startup')
-def startup(): init(); ingestion.recover(); material.recover()
+def startup(): init(); ingestion.recover(); material.recover(); study.prewarm()
 
 @app.middleware('http')
 async def protect(request:Request,call_next):
@@ -55,19 +57,33 @@ def me(): return {'authenticated':True}
 @app.get('/api/tree')
 def tree():
     with db() as c:
+        grades={}
+        for row in c.execute('SELECT id,subtopic_id,known FROM recent_grades ORDER BY id DESC'):
+            grades.setdefault(row['subtopic_id'],[]).append((row['id'],bool(row['known'])))
         courses=[dict(r) for r in c.execute('SELECT * FROM courses ORDER BY name COLLATE NOCASE')]
         for course in courses:
             course['topics']=[dict(r) for r in c.execute('SELECT * FROM topics WHERE course_id=? ORDER BY name COLLATE NOCASE',(course['id'],))]
             values=[]
             for topic in course['topics']:
                 topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency,graded_count FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
-                topic['files']=[dict(r) for r in c.execute('SELECT id,original_name,size_bytes,status,error FROM files WHERE topic_id=? ORDER BY id',(topic['id'],))]
+                for subtopic in topic['subtopics']:
+                    subtopic['recent_answers']=[x[1] for x in grades.get(subtopic['id'],[])[:5]]
+                topic['files']=[dict(r) for r in c.execute('SELECT f.id,f.original_name,f.size_bytes,f.status,f.error,(SELECT g.description FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS generated_description,(SELECT g.requested_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS requested_name,(SELECT g.concept_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS concept_name FROM files f WHERE f.topic_id=? ORDER BY f.id',(topic['id'],))]
+                for file in topic['files']:
+                    description=file.pop('generated_description')
+                    requested=file.pop('requested_name'); concept=file.pop('concept_name')
+                    if description: file['original_name']=generated_filename(file['original_name'],description,requested,concept)
                 topic['generations']=[dict(r) for r in c.execute("SELECT id,status,error FROM material_generations WHERE topic_id=? AND status IN ('queued','running','failed') ORDER BY id",(topic['id'],))]
                 vs=[s['proficiency'] for s in topic['subtopics']]; values.extend(vs)
                 topic['graded_count']=sum(s['graded_count'] for s in topic['subtopics'])
+                topic_grades=sorted((g for sub in topic['subtopics'] for g in grades.get(sub['id'],[])),reverse=True)
+                topic['recent_answers']=[x[1] for x in topic_grades[:5]]
+                topic['_grade_order']=topic_grades[:5]
                 topic['proficiency']=sum(vs)/len(vs) if vs else None
             course['proficiency']=sum(values)/len(values) if values else None
             course['graded_count']=sum(t['graded_count'] for t in course['topics'])
+            course_grades=sorted((g for t in course['topics'] for g in t.pop('_grade_order')),reverse=True)
+            course['recent_answers']=[x[1] for x in course_grades[:5]]
         return courses
 
 async def get_name(request):
@@ -108,9 +124,14 @@ async def rename(item_id:int,request:Request):
 def delete(item_id:int,request:Request):
     table='courses' if '/courses/' in request.url.path else 'topics'
     with db() as c:
-        if table=='courses': files=c.execute('SELECT f.storage_key FROM files f JOIN topics t ON t.id=f.topic_id WHERE t.course_id=?',(item_id,)).fetchall()
-        else: files=c.execute('SELECT storage_key FROM files WHERE topic_id=?',(item_id,)).fetchall()
+        if table=='courses':
+            topic_ids=[r[0] for r in c.execute('SELECT id FROM topics WHERE course_id=?',(item_id,))]
+            files=c.execute('SELECT f.storage_key FROM files f JOIN topics t ON t.id=f.topic_id WHERE t.course_id=?',(item_id,)).fetchall()
+        else:
+            topic_ids=[item_id]
+            files=c.execute('SELECT storage_key FROM files WHERE topic_id=?',(item_id,)).fetchall()
         if not c.execute(f'DELETE FROM {table} WHERE id=?',(item_id,)).rowcount: return error('not_found','Item not found.',404)
+    study.invalidate_topics(topic_ids)
     for f in files: Path(UPLOADS,f['storage_key']).unlink(missing_ok=True)
     return {'ok':True}
 
@@ -181,8 +202,12 @@ def delete_material_job(job_id:int):
 
 @app.get('/api/files/{file_id}')
 def download(file_id:int):
-    with db() as c: f=c.execute('SELECT * FROM files WHERE id=?',(file_id,)).fetchone()
+    with db() as c: f=c.execute('SELECT f.*,(SELECT g.description FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS generated_description,(SELECT g.requested_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS requested_name,(SELECT g.concept_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS concept_name FROM files f WHERE f.id=?',(file_id,)).fetchone()
     if not f or not Path(UPLOADS,f['storage_key']).exists(): return error('not_found','File not found.',404)
+    if f['generated_description']:
+        body=Path(UPLOADS,f['storage_key']).read_text(encoding='utf-8')
+        filename=generated_filename(f['original_name'],f['generated_description'],f['requested_name'],f['concept_name'])
+        return Response(content=generated_reference(body,f['generated_description'],filename),media_type='text/plain',headers={'Content-Disposition':"inline; filename*=UTF-8''"+quote(filename)})
     return FileResponse(Path(UPLOADS,f['storage_key']),media_type=f['mime_type'],filename=f['original_name'],content_disposition_type='inline')
 
 @app.delete('/api/files/{file_id}')
