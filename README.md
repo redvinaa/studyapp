@@ -1,6 +1,6 @@
 # Study
 
-A single-user, online retrieval-practice app for PDF, Markdown, and text course material. Files and proficiency are stored on the host; embeddings are computed locally with FastEmbed. The configured language model creates subtopics and source-cited questions. Failed questions return until answered correctly; proficiency is an exponentially weighted self-assessment, not a spaced-repetition schedule.
+A single-user, online retrieval-practice app for PDF, Markdown, and text course material. Upload files or generate AI-written study notes from a description of what you need to learn. Generated notes are labeled and should be checked against reliable sources. Files and proficiency are stored on the host; embeddings are computed locally with FastEmbed. The configured language model creates subtopics and source-cited questions. Failed questions return until answered correctly; proficiency is an exponentially weighted self-assessment, not a spaced-repetition schedule.
 
 ## Run
 
@@ -12,7 +12,7 @@ python -c 'from argon2 import PasswordHasher; import getpass; print(PasswordHash
 
 Put the hash in single quotes in `.env` so Compose preserves the `$` characters. Run `docker compose up -d --build`. The web container listens only on `127.0.0.1:8788`; configure a TLS reverse proxy or Cloudflare Tunnel to reach it. Cookies require HTTPS. To use Ollama, start the `local` Compose profile and pull the configured model separately. GPU access is not configured by default; the local Ollama profile has not been validated for Jetson acceleration.
 
-For OpenAI, explicitly set `LLM_PROVIDER=openai`, `CLOUD_ENABLED=true`, `OPENAI_API_KEY` and `LLM_MODEL`. Source excerpts and summaries are sent to the configured provider when indexing or generating questions. Keep `.env` private and out of version control. Reindex all topics after changing embedding models. The first indexing job downloads the embedding model to the persistent model volume.
+For OpenAI, explicitly set `LLM_PROVIDER=openai`, `CLOUD_ENABLED=true`, `OPENAI_API_KEY` and `LLM_MODEL`. Source excerpts, summaries and descriptions for generated notes are sent to the configured provider when indexing or generating content. Keep `.env` private and out of version control. Reindex all topics after changing embedding models. The first indexing job downloads the embedding model to the persistent model volume.
 
 The Jetson installation uses Pigeo's existing OpenAI key and model. The app itself binds only to loopback, with HTTPS provided by the remotely managed Cloudflare tunnel. The backend runs as one process and is not publicly exposed.
 

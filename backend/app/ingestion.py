@@ -13,11 +13,14 @@ def enqueue(topic_id):
         if not c.execute('SELECT 1 FROM topics WHERE id=?',(topic_id,)).fetchone(): return None
         job = c.execute("INSERT INTO ingestion_jobs(topic_id,status) VALUES(?,'queued')",(topic_id,)).lastrowid
         c.execute("UPDATE topics SET index_status='queued',last_error=NULL WHERE id=?",(topic_id,))
+    schedule(topic_id)
+    return job
+
+def schedule(topic_id):
     with _guard:
         if topic_id not in _pending:
             _pending.add(topic_id)
             executor.submit(_run, topic_id)
-    return job
 
 def recover():
     with db() as c:

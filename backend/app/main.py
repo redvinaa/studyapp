@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from argon2 import PasswordHasher
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 from .db import db, init, UPLOADS
-from . import ingestion, study
+from . import ingestion, material, study
 
 app=FastAPI()
 secret=os.environ['SESSION_SECRET']; password_hash=os.environ['PASSWORD_HASH']
@@ -15,7 +15,7 @@ MAX_BYTES=int(os.getenv('MAX_UPLOAD_MB','50'))*1024*1024
 def error(code,message,status): return JSONResponse({'error':{'code':code,'message':message}},status_code=status)
 
 @app.on_event('startup')
-def startup(): init(); ingestion.recover()
+def startup(): init(); ingestion.recover(); material.recover()
 
 @app.middleware('http')
 async def protect(request:Request,call_next):
@@ -62,6 +62,7 @@ def tree():
             for topic in course['topics']:
                 topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
                 topic['files']=[dict(r) for r in c.execute('SELECT id,original_name,size_bytes,status,error FROM files WHERE topic_id=? ORDER BY id',(topic['id'],))]
+                topic['generations']=[dict(r) for r in c.execute("SELECT id,status,error FROM material_generations WHERE topic_id=? AND status IN ('queued','running','failed') ORDER BY id",(topic['id'],))]
                 vs=[s['proficiency'] for s in topic['subtopics']]; values.extend(vs)
                 topic['proficiency']=sum(vs)/len(vs) if vs else None
             course['proficiency']=sum(values)/len(values) if values else None
@@ -145,6 +146,31 @@ async def upload(topic_id:int,files:list[UploadFile]=File(...)):
         finally: temp.unlink(missing_ok=True); await f.close()
     job=ingestion.enqueue(topic_id) if any(not x['duplicate'] for x in added) else None
     return {'files':added,'job_id':job}
+
+@app.post('/api/topics/{topic_id}/generate-material',status_code=202)
+async def generate_material(topic_id:int, request:Request):
+    try:
+        description=(await request.json()).get('description','')
+        if not isinstance(description,str): raise ValueError()
+        description=description.strip()
+        if not 10 <= len(description) <= 8000: raise ValueError()
+    except (ValueError,TypeError,AttributeError):
+        return error('invalid_description','Describe what you need to learn in 10 to 8,000 characters.',400)
+    job_id=material.create(topic_id,description)
+    if job_id is None: return error('not_found','Topic not found.',404)
+    return {'generation_id':job_id}
+
+@app.post('/api/material-generations/{job_id}/retry',status_code=202)
+def retry_material(job_id:int):
+    if not material.retry(job_id): return error('not_found','Failed generation not found.',404)
+    return {'generation_id':job_id}
+
+@app.delete('/api/material-generations/{job_id}')
+def delete_material_job(job_id:int):
+    with db() as c:
+        if not c.execute("DELETE FROM material_generations WHERE id=? AND status='failed'",(job_id,)).rowcount:
+            return error('not_found','Failed generation not found.',404)
+    return {'ok':True}
 
 @app.get('/api/files/{file_id}')
 def download(file_id:int):
