@@ -42,8 +42,13 @@ CREATE TABLE IF NOT EXISTS material_generations(id INTEGER PRIMARY KEY, topic_id
 CREATE INDEX IF NOT EXISTS generations_topic ON material_generations(topic_id);
 
 ''')
+        subtopic_columns = {row['name'] for row in c.execute('PRAGMA table_info(subtopics)')}
+        if 'graded_count' not in subtopic_columns:
+            c.execute('ALTER TABLE subtopics ADD COLUMN graded_count INTEGER NOT NULL DEFAULT 0')
         columns = {row['name'] for row in c.execute('PRAGMA table_info(material_generations)')}
         if 'concept_scope' not in columns:
             c.execute('ALTER TABLE material_generations ADD COLUMN concept_scope TEXT')
         if 'concept_name' not in columns:
             c.execute('ALTER TABLE material_generations ADD COLUMN concept_name TEXT')
+        if 'requested_name' not in columns:
+            c.execute('ALTER TABLE material_generations ADD COLUMN requested_name TEXT')

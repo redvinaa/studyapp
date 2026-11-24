@@ -60,12 +60,14 @@ def tree():
             course['topics']=[dict(r) for r in c.execute('SELECT * FROM topics WHERE course_id=? ORDER BY name COLLATE NOCASE',(course['id'],))]
             values=[]
             for topic in course['topics']:
-                topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
+                topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency,graded_count FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
                 topic['files']=[dict(r) for r in c.execute('SELECT id,original_name,size_bytes,status,error FROM files WHERE topic_id=? ORDER BY id',(topic['id'],))]
                 topic['generations']=[dict(r) for r in c.execute("SELECT id,status,error FROM material_generations WHERE topic_id=? AND status IN ('queued','running','failed') ORDER BY id",(topic['id'],))]
                 vs=[s['proficiency'] for s in topic['subtopics']]; values.extend(vs)
+                topic['graded_count']=sum(s['graded_count'] for s in topic['subtopics'])
                 topic['proficiency']=sum(vs)/len(vs) if vs else None
             course['proficiency']=sum(values)/len(values) if values else None
+            course['graded_count']=sum(t['graded_count'] for t in course['topics'])
         return courses
 
 async def get_name(request):
@@ -150,13 +152,18 @@ async def upload(topic_id:int,files:list[UploadFile]=File(...)):
 @app.post('/api/topics/{topic_id}/generate-material',status_code=202)
 async def generate_material(topic_id:int, request:Request):
     try:
-        description=(await request.json()).get('description','')
+        data=await request.json()
+        description=data.get('description','')
+        name=data.get('name')
         if not isinstance(description,str): raise ValueError()
+        if name is not None:
+            if not isinstance(name,str) or len(name.strip())>100 or any(x in name for x in ('/','\\','\x00')): raise ValueError()
+            name=name.strip() or None
         description=description.strip()
         if not 10 <= len(description) <= 8000: raise ValueError()
     except (ValueError,TypeError,AttributeError):
         return error('invalid_description','Describe what you need to learn in 10 to 8,000 characters.',400)
-    job_id=material.create(topic_id,description)
+    job_id=material.create(topic_id,description,name)
     if job_id is None: return error('not_found','Topic not found.',404)
     return {'generation_id':job_id}
 

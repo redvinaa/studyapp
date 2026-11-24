@@ -10,11 +10,11 @@ from . import ingestion
 
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='material')
 
-def create(topic_id, description):
+def create(topic_id, description, name=None):
     with db() as c:
         if not c.execute('SELECT 1 FROM topics WHERE id=?', (topic_id,)).fetchone():
             return None
-        job_id = c.execute('INSERT INTO material_generations(topic_id,description) VALUES(?,?)', (topic_id,description)).lastrowid
+        job_id = c.execute('INSERT INTO material_generations(topic_id,description,requested_name) VALUES(?,?,?)', (topic_id,description,name)).lastrowid
     executor.submit(_run, job_id)
     return job_id
 
@@ -42,8 +42,10 @@ def _run(job_id):
             if not job:
                 return
             job = dict(job)
-        prompt = ("Create concise, accurate university-level study notes for the requested subject. "
-                  "Explain key concepts, definitions, formulas and short examples where appropriate. "
+        prompt = ("Create a compact, factual reference for generating retrieval-practice questions about the requested subject. "
+                  "This is a retrieval source, not a lesson. Use terse bullet points, typically 100–250 words for a single subject, "
+                  "with key definitions, distinctions, formulas, constraints and only essential context. Avoid long explanations, "
+                  "introductions, repeated points, exercises, and invented references. "
                   "Do not invent citations, claim access to a syllabus, or imply these notes were supplied by the user. "
                   "If the description is ambiguous, state the assumptions. Return JSON with one nonempty string field "
                   "named 'material' containing Markdown notes and a 'focus' object with 'scope' ('single' or 'multiple') "
@@ -82,8 +84,12 @@ def _run(job_id):
                     file_id = existing['id']
                     final.unlink(missing_ok=True)
                 else:
+                    filename = job['requested_name'] or focus_name or job['description'].split('\n')[0][:80]
+                    filename = ' '.join(filename.replace('/',' ').replace('\\',' ').split()).strip('. ') or 'Study material'
+                    if filename.lower().endswith('.md'):
+                        filename = filename[:-3].strip('. ') or 'Study material'
                     file_id = c.execute('INSERT INTO files(topic_id,original_name,storage_key,sha256,mime_type,size_bytes) VALUES(?,?,?,?,?,?)',
-                                        (job['topic_id'],f'AI-generated material {job_id}.md',key,digest,'text/plain',len(content))).lastrowid
+                                        (job['topic_id'],f'{filename} (AI-generated).md',key,digest,'text/plain',len(content))).lastrowid
                 c.execute("UPDATE material_generations SET status='complete',file_id=?,concept_scope=?,concept_name=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(file_id,scope,focus_name,job_id))
                 c.execute("INSERT INTO ingestion_jobs(topic_id,status) VALUES(?,'queued')",(job['topic_id'],))
                 c.execute("UPDATE topics SET index_status='queued',last_error=NULL WHERE id=?",(job['topic_id'],))
