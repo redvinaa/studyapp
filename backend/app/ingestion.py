@@ -59,7 +59,11 @@ class ReadableHTML(HTMLParser):
         if self.main:self.featured.append(text)
     def text(self):
         focused=''.join(self.featured).strip()
-        return focused or ''.join(self.parts).strip()
+        text=focused or ''.join(self.parts).strip()
+        # DOM nesting creates blank lines, not meaningful document boundaries.
+        # Counting those toward the extraction window splits quiz questions
+        # from their answers and leaves almost empty chunks.
+        return '\n'.join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def generate_json(prompt):

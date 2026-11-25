@@ -108,7 +108,33 @@ def _select_sources(sub, rows):
     if lexical.max()>0:scores=scores+.25*lexical/lexical.max()
     ranked=np.argsort(scores)[::-1][:8].tolist()
     chosen=[i for i in ranked if scores[i]>=max(0,float(scores[ranked[0]])*.65)][:5] or ranked[:1]
-    return [rows[i] for i in chosen]
+    return _source_context([rows[i] for i in chosen],rows)
+
+_QUIZ_QUESTION=re.compile(r'\bResults for question\s+\d+\b',re.IGNORECASE)
+
+def _source_context(selected, rows):
+    """Keep HTML answers attached to their question and category headings."""
+    result=[];seen=set()
+    for hit in selected:
+        group=[hit]
+        if Path(hit.get('filename','')).suffix.lower() in ('.html','.htm'):
+            document=sorted((row for row in rows if row['file_id']==hit['file_id']),key=lambda row:row['ordinal'])
+            index=next(i for i,row in enumerate(document) if row['id']==hit['id'])
+            # Old HTML indexes can contain only a few words per chunk because
+            # nested markup produced many blank lines. Recover full quiz items
+            # from those indexes too, without requiring a destructive rebuild.
+            start=max(0,index-2);end=min(len(document),index+3)
+            questions=[i for i in range(max(0,index-12),index+1) if _QUIZ_QUESTION.search(document[i]['content'])]
+            if questions:
+                start=questions[-1]
+                end=next((i for i in range(index+1,min(len(document),start+16)) if _QUIZ_QUESTION.search(document[i]['content'])),min(len(document),start+16))
+            group=document[start:end]
+            if sum(len(row['content'].split()) for row in group)>1400:
+                group=document[max(0,index-1):min(len(document),index+2)]
+        for row in group:
+            if row['id'] not in seen:
+                result.append(row);seen.add(row['id'])
+    return result
 
 def _make(sub, recent):
     with db() as c:
@@ -128,6 +154,9 @@ def _make(sub, recent):
             f"If the source describes a specific exercise, turn it into a general conceptual question or include all needed facts directly in the front. "
             f"The subject name may already be visible, so do not ask the learner to guess the subject name. "
             f"Test exactly ONE atomic piece of relevant information: one fact, relationship, step, or small calculation. Never ask for an overview, a list of properties, or multiple parts. "
+            f"The subtopic description guides relevance; it is not source evidence. You only need evidence for the single fact tested, not every detail of the subtopic. "
+            f"Quiz excerpts may include wrong student answers: distinguish them from the labeled correct answers, using the surrounding question and category headings. "
+            f"If the requested card type needs facts absent from the excerpts, use a simple recall question about a supported fact instead of inventing premises or reporting insufficient context. "
             f"Keep the front under 45 words and back under 80 words, preferably 1–3 short sentences. Include only reasoning needed for this one answer. "
             f"Both front and back may use Markdown, code and LaTeX. Favor short text that fits a vertical mobile card. "
             f"Avoid these recent questions: {json.dumps(recent[-10:])}. Before responding, check whether the front reveals the answer; "

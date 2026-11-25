@@ -652,3 +652,33 @@ def test_course_priority_chooses_topic_before_subtopic(monkeypatch):
     calls.clear()
     study._choose_subtopic(large+small,'course',large+small+[unavailable])
     assert calls[0][1][1]==study._priority(small+[unavailable])
+
+
+def test_html_retrieval_includes_question_and_correct_answer_context():
+    def row(id,content,file=1):
+        return {'id':id,'file_id':file,'ordinal':id,'filename':'quiz.html','content':content}
+    rows=[row(10,'Results for question 8. Categorize platforms as warehouses, lakes, or neither.'),
+          row(11,'Category Data Warehouse Correct answer: Snowflake'),
+          row(12,'Correct answer: Amazon Redshift'),
+          row(13,'Correct answer: Google BigQuery Category Data Lake'),
+          row(14,'Correct answer: Databricks'),
+          row(15,'Results for question 9. Compare RAID levels.'),
+          row(16,'RAID 1 mirrors data.'),
+          row(12,'Unrelated material from a separate document.',file=2)]
+    # Chunk IDs are globally unique in the database.
+    rows[-1]['id']=99
+    selected=study._source_context([rows[2],rows[0]],rows)
+    assert [r['id'] for r in selected]==[10,11,12,13,14]
+    assert all(r['file_id']==1 for r in selected)
+    assert study._source_context([rows[5]],rows)==rows[5:7]
+
+
+def test_html_blank_markup_does_not_separate_question_and_answers(tmp_path,monkeypatch):
+    monkeypatch.setattr(ingestion,'UPLOADS',str(tmp_path))
+    markup='<html><main><div><div><p>Which platform is a warehouse?</p></div></div>'+('\n'*80)+'<div><div><p>Correct answer: Snowflake</p></div></div>'+('\n'*80)+'<div><p>Correct answer: Amazon Redshift</p></div></main></html>'
+    (tmp_path/'quiz').write_text(markup)
+    chunks=ingestion.extract({'original_name':'quiz.html','storage_key':'quiz'})
+    assert len(chunks)==1
+    assert 'Which platform is a warehouse?' in chunks[0][0]
+    assert 'Correct answer: Snowflake' in chunks[0][0]
+    assert 'Correct answer: Amazon Redshift' in chunks[0][0]
