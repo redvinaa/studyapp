@@ -44,3 +44,10 @@ html,body{touch-action:manipulation;-webkit-text-size-adjust:100%;text-size-adju
 .card-kind{padding-left:0}
 
 .card-heading{min-width:0;flex:1;margin-right:12px;display:flex;flex-direction:column;gap:3px}.card-subtopic{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;font-size:13px;line-height:1.35;font-weight:600;color:var(--ink);text-wrap:pretty}.card-heading .card-kind{align-self:flex-start;margin:0;padding:0}.card-tools>.icon-button{flex:none}
+
+/* Keep card actions anchored while the title wraps. */
+.flashcard{--card-inline:30px;--card-top:24px}
+.card-tools{align-items:flex-start;margin:calc(-1 * var(--card-top)) calc(-1 * var(--card-inline)) 16px;padding:14px 12px 14px var(--card-inline);background:#f4f7f0;border-bottom:1px solid var(--line)}
+.card-tools>.icon-button{align-self:flex-start}
+.card-heading{padding-top:4px}
+@media(max-width:600px){.flashcard{--card-inline:20px;--card-top:20px}}
