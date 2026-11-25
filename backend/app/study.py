@@ -17,7 +17,7 @@ logger=logging.getLogger('uvicorn.error')
 def eligible(c, scope, id):
     where={'course':'t.course_id=?','topic':'s.topic_id=?','subtopic':'s.id=?'}.get(scope)
     if not where: return []
-    return [dict(r) for r in c.execute(f"SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE {where} AND s.active=1 AND t.index_status IN ('ready','error') AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready')",(id,))]
+    return [dict(r) for r in c.execute(f"SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE {where} AND s.active=1 AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready')",(id,))]
 
 def create(scope,id,saved_only=False):
     with db() as c:
@@ -38,7 +38,7 @@ def create(scope,id,saved_only=False):
                 saved_queue=[r['id'] for r in c.execute(f'SELECT id FROM saved_cards WHERE subtopic_id IN ({marks})',[sub['id'] for sub in subs])]
             random.shuffle(saved_queue)
         sid=secrets.token_urlsafe(24)
-        sessions[sid]={'scope':scope,'id':id,'saved_only':saved_only,'saved_queue':saved_queue,'current':None,'recent':[],'cooldown':{},'count':0,'last':time.monotonic(),'last_grade':None,'generating':False,'error':None,'queue':[]}
+        sessions[sid]={'scope':scope,'id':id,'saved_only':saved_only,'saved_queue':saved_queue,'current':None,'upcoming':None,'recent':[],'cooldown':{},'count':0,'last':time.monotonic(),'last_grade':None,'generating':False,'error':None,'queue':[]}
     return sid
 
 def get(sid):
@@ -94,7 +94,7 @@ def _make(sub, recent):
 
 def _all_eligible():
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE s.active=1 AND t.index_status IN ('ready','error') AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready') ORDER BY s.id")]
+        return [dict(r) for r in c.execute("SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE s.active=1 AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready') ORDER BY s.id")]
 
 def prewarm():
     """Keep two new cards ready for every indexed subtopic, using one worker."""
@@ -171,6 +171,16 @@ def next_card(sid):
         s=get(sid)
         if not s: return 'expired',None
         if s['current']: return 'ready',s['current']
+        if s.get('upcoming'):
+            card=s.pop('upcoming')
+            with db() as c:
+                sub=c.execute('SELECT s.active,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE s.id=?',(card['subtopic_id'],)).fetchone()
+                saved=not s.get('saved_only') or c.execute('SELECT 1 FROM saved_cards WHERE id=?',(card.get('saved_id'),)).fetchone()
+            with db() as c: failed_exists=not card.get('failed_id') or bool(c.execute('SELECT 1 FROM failed_cards WHERE id=?',(card['failed_id'],)).fetchone())
+            if sub and sub['active'] and saved and failed_exists and sub['index_revision']==card['revision']:
+                s['current']=card
+                return 'ready',card
+            if s.get('saved_only') and saved: s['saved_queue'].insert(0,card['saved_id'])
         with db() as c:
             subs=eligible(c,s['scope'],s['id'])
             if not subs: return 'error','The selected material is no longer available.'
@@ -225,7 +235,10 @@ def grade(sid, token, known=None):
             return 'ok',{'skipped':True}
         with db() as c:
             sub=c.execute('SELECT s.proficiency,s.active,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE s.id=?',(card['subtopic_id'],)).fetchone()
-            if not sub or not sub['active'] or sub['index_revision']!=card['revision']: return 'stale',None
+            if not sub or not sub['active']: return 'stale',None
+            if sub['index_revision']!=card['revision']:
+                ids={source['file_id'] for source in card.get('sources',[])}
+                if not ids or any(not c.execute("SELECT 1 FROM files WHERE id=? AND topic_id=? AND status='ready'",(file_id,card['topic_id'])).fetchone() for file_id in ids): return 'stale',None
             alpha=float(os.getenv('ALPHA','0.2'))
             p=(1-alpha)*sub['proficiency']+alpha*int(known)
             c.execute('UPDATE subtopics SET proficiency=?,graded_count=graded_count+1 WHERE id=?',(p,card['subtopic_id']))
@@ -293,3 +306,20 @@ def conversation(sid,token,message=None):
             return 'ok',{'messages':card['conversation']}
     finally:
         with lock: card['chatting']=False
+
+
+def peek(sid,token):
+    """Reserve one future card without advancing the card being answered."""
+    with lock:
+        session=get(sid)
+        if not session: return 'expired',None
+        current=session['current']
+        if not current or current['card_token']!=token: return 'stale',None
+        if session.get('upcoming'): return 'ready',session['upcoming']
+        session['current']=None
+        try:
+            state,card=next_card(sid)
+            if state=='ready': session['upcoming']=card
+            return state,card
+        finally:
+            session['current']=current

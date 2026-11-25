@@ -12,11 +12,11 @@ from . import ingestion
 
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='material')
 
-def create(topic_id, description, name=None):
+def create(topic_id, description, name=None, size="medium"):
     with db() as c:
         if not c.execute('SELECT 1 FROM topics WHERE id=?', (topic_id,)).fetchone():
             return None
-        job_id = c.execute('INSERT INTO material_generations(topic_id,description,requested_name) VALUES(?,?,?)', (topic_id,description,name)).lastrowid
+        job_id = c.execute('INSERT INTO material_generations(topic_id,description,requested_name,material_size) VALUES(?,?,?,?)', (topic_id,description,name,size)).lastrowid
     executor.submit(_run, job_id)
     return job_id
 
@@ -44,11 +44,12 @@ def _run(job_id):
             if not job:
                 return
             job = dict(job)
+        detail={'small':('one distinct question','40–80 words'),'medium':('about five distinct questions','150–300 words'),'large':('about ten distinct questions','300–550 words')}[job['material_size']]
         prompt = ("Create a compact, factual reference for generating retrieval-practice questions about the requested subject. "
                   "This is a reference for writing standalone questions, not a lesson or copy of the request. "
                   "Extract and explain the general domain concepts rather than repeating an assignment, task instructions, "
                   "specific file names, commands, evaluation requirements, or descriptions of an exercise. "
-                  "Use terse bullet points, typically 100–250 words for a single subject, "
+                  f"Provide enough distinct, relevant facts for {detail[0]}, roughly {detail[1]}. Use terse bullet points "
                   "with key definitions, distinctions, formulas, constraints and only essential context. Avoid long explanations, "
                   "introductions, repeated points, exercises, invented references, disclaimers, or mentions of AI generation. "
                   "Do not invent citations, claim access to a syllabus, or imply these notes were supplied by the user. "

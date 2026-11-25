@@ -47,6 +47,14 @@ CREATE INDEX IF NOT EXISTS generations_topic ON material_generations(topic_id);
 
 ''')
         subtopic_columns = {row['name'] for row in c.execute('PRAGMA table_info(subtopics)')}
+        if 'size' not in subtopic_columns:
+            c.execute('ALTER TABLE subtopics ADD COLUMN size INTEGER NOT NULL DEFAULT 5 CHECK(size BETWEEN 1 AND 5)')
+            for topic in c.execute('SELECT id FROM topics').fetchall():
+                subs=c.execute('SELECT id FROM subtopics WHERE topic_id=?',(topic['id'],)).fetchall()
+                words=sum(len(row[0].split()) for row in c.execute('SELECT ch.content FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=?',(topic['id'],)))
+                estimate=words/max(1,len(subs))
+                size=1+sum(estimate>threshold for threshold in (120,350,700,1400))
+                c.execute('UPDATE subtopics SET size=? WHERE topic_id=?',(size,topic['id']))
         if 'graded_count' not in subtopic_columns:
             c.execute('ALTER TABLE subtopics ADD COLUMN graded_count INTEGER NOT NULL DEFAULT 0')
         columns = {row['name'] for row in c.execute('PRAGMA table_info(material_generations)')}
@@ -56,3 +64,6 @@ CREATE INDEX IF NOT EXISTS generations_topic ON material_generations(topic_id);
             c.execute('ALTER TABLE material_generations ADD COLUMN concept_name TEXT')
         if 'requested_name' not in columns:
             c.execute('ALTER TABLE material_generations ADD COLUMN requested_name TEXT')
+
+        if 'material_size' not in columns:
+            c.execute("ALTER TABLE material_generations ADD COLUMN material_size TEXT NOT NULL DEFAULT 'medium'")

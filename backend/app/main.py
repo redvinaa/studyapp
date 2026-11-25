@@ -54,6 +54,11 @@ def logout(response:Response): response.delete_cookie('study_session',secure=Tru
 @app.get('/api/me')
 def me(): return {'authenticated':True}
 
+def average_progress(children,weighted=False):
+    if not children: return {'known':0.,'again':0.,'unanswered':1.}
+    weights=[child.get('size',5) if weighted else 1 for child in children]
+    return {key:sum(child['progress'][key]*weight for child,weight in zip(children,weights))/sum(weights) for key in ('known','again','unanswered')}
+
 @app.get('/api/tree')
 def tree():
     with db() as c:
@@ -66,10 +71,12 @@ def tree():
             course['topics']=[dict(r) for r in c.execute('SELECT * FROM topics WHERE course_id=? ORDER BY name COLLATE NOCASE',(course['id'],))]
             values=[]
             for topic in course['topics']:
-                topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency,graded_count FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
+                topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency,graded_count,size FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
                 for subtopic in topic['subtopics']:
                     subtopic['saved_count']=saved_counts.get(subtopic['id'],0)
-                    subtopic['recent_answers']=[x[1] for x in grades.get(subtopic['id'],[])[:5]]
+                    subtopic['recent_answers']=[x[1] for x in grades.get(subtopic['id'],[])[:subtopic['size']]]
+                    answers=subtopic['recent_answers']
+                    subtopic['progress']={'known':sum(answers)/subtopic['size'],'again':(len(answers)-sum(answers))/subtopic['size'],'unanswered':(subtopic['size']-len(answers))/subtopic['size']}
                 topic['files']=[dict(r) for r in c.execute('SELECT f.id,f.original_name,f.size_bytes,f.status,f.error,(SELECT g.description FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS generated_description,(SELECT g.requested_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS requested_name,(SELECT g.concept_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS concept_name FROM files f WHERE f.topic_id=? ORDER BY f.id',(topic['id'],))]
                 for file in topic['files']:
                     description=file.pop('generated_description')
@@ -79,15 +86,15 @@ def tree():
                 vs=[s['proficiency'] for s in topic['subtopics']]; values.extend(vs)
                 topic['saved_count']=sum(s['saved_count'] for s in topic['subtopics'])
                 topic['graded_count']=sum(s['graded_count'] for s in topic['subtopics'])
-                topic_grades=sorted((g for sub in topic['subtopics'] for g in grades.get(sub['id'],[])),reverse=True)
-                topic['recent_answers']=[x[1] for x in topic_grades[:5]]
-                topic['_grade_order']=topic_grades[:5]
+                topic['progress']=average_progress(topic['subtopics'],weighted=True)
+                topic['can_study']=bool(topic['subtopics']) and bool(c.execute("SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=? AND f.status='ready' LIMIT 1",(topic['id'],)).fetchone())
                 topic['proficiency']=sum(vs)/len(vs) if vs else None
-            course['proficiency']=sum(values)/len(values) if values else None
+            topic_values=[t['proficiency'] or 0 for t in course['topics']]
+            course['proficiency']=sum(topic_values)/len(topic_values) if any(t['proficiency'] is not None for t in course['topics']) else None
+            course['progress']=average_progress(course['topics'])
+            course['can_study']=any(t['can_study'] for t in course['topics'])
             course['saved_count']=sum(t['saved_count'] for t in course['topics'])
             course['graded_count']=sum(t['graded_count'] for t in course['topics'])
-            course_grades=sorted((g for t in course['topics'] for g in t.pop('_grade_order')),reverse=True)
-            course['recent_answers']=[x[1] for x in course_grades[:5]]
         return courses
 
 async def get_name(request):
@@ -186,6 +193,8 @@ async def generate_material(topic_id:int, request:Request):
         data=await request.json()
         description=data.get('description','')
         name=data.get('name')
+        material_size=data.get('size','medium')
+        if material_size not in ('small','medium','large'): raise ValueError()
         if not isinstance(description,str): raise ValueError()
         if name is not None:
             if not isinstance(name,str) or len(name.strip())>100 or any(x in name for x in ('/','\\','\x00')): raise ValueError()
@@ -194,7 +203,7 @@ async def generate_material(topic_id:int, request:Request):
         if not 10 <= len(description) <= 8000: raise ValueError()
     except (ValueError,TypeError,AttributeError):
         return error('invalid_description','Describe what you need to learn in 10 to 8,000 characters.',400)
-    job_id=material.create(topic_id,description,name)
+    job_id=material.create(topic_id,description,name,material_size)
     if job_id is None: return error('not_found','Topic not found.',404)
     return {'generation_id':job_id}
 
@@ -265,6 +274,9 @@ async def grade(sid:str,request:Request):
     except (ValueError,KeyError,TypeError): return error('invalid_request','Invalid grade.',400)
     state,result=study.grade(sid,token,known)
     if state!='ok': return error('stale_session','This card or session is no longer current.',409)
+    if data.get('advance') is True:
+        next_state,next_value=study.next_card(sid)
+        return {**result,'next_state':next_state,'next_card':next_value if next_state=='ready' else None}
     return result
 @app.delete('/api/sessions/{sid}')
 def end_session(sid:str):
@@ -287,9 +299,21 @@ def preview(file_id:int):
     if not row: return error('not_found','File not found.',404)
     file=dict(row)
     try:
+        if Path(file['original_name']).suffix.lower()=='.pdf':
+            import fitz
+            with fitz.open(Path(UPLOADS,file['storage_key'])) as doc:
+                return {'kind':'pdf','pages':len(doc)}
+        if Path(file['original_name']).suffix.lower()=='.ipynb':
+            notebook=json.loads(Path(UPLOADS,file['storage_key']).read_text(encoding='utf-8-sig'))
+            language=notebook.get('metadata',{}).get('language_info',{}).get('name','python')
+            cells=[]
+            for cell in notebook.get('cells',[]):
+                source=cell.get('source',[])
+                cells.append({'kind':cell.get('cell_type'),'content':''.join(source) if isinstance(source,list) else source,'language':language})
+            return {'kind':'notebook','cells':cells}
         content=ingestion.extract(file,preview=True)
     except (ValueError,OSError) as e: return error('preview_failed',str(e),422)
-    return {'content':content[:500000],'truncated':len(content)>500000}
+    return {'kind':'text','content':content[:500000],'truncated':len(content)>500000}
 
 
 @app.get('/api/sessions/{sid}/conversation')
@@ -311,3 +335,28 @@ async def ask(sid:str,request:Request):
     if state=='busy': return error('conversation_busy','An answer is already being prepared.',409)
     if state!='ok': return error('stale_session','This card is no longer current.',409)
     return result
+
+
+@app.get('/api/sessions/{sid}/peek')
+def peek_card(sid:str,card_token:str):
+    state,card=study.peek(sid,card_token)
+    if state=='expired': return error('session_expired','Session expired.',409)
+    if state=='stale': return error('stale_session','This card is no longer current.',409)
+    if state=='error': return error('generation_failed',card,503)
+    if state=='loading': return JSONResponse({'status':'generating'},status_code=202)
+    if state=='complete': return {'status':'complete'}
+    return card
+
+
+@app.get('/api/files/{file_id}/pages/{page}')
+def pdf_page(file_id:int,page:int):
+    import fitz
+    with db() as c: file=c.execute('SELECT * FROM files WHERE id=?',(file_id,)).fetchone()
+    if not file or Path(file['original_name']).suffix.lower()!='.pdf': return error('not_found','PDF not found.',404)
+    try:
+        with fitz.open(Path(UPLOADS,file['storage_key'])) as doc:
+            if page<1 or page>len(doc): return error('not_found','Page not found.',404)
+            sheet=doc[page-1]
+            scale=min(1.7,1800/max(sheet.rect.width,sheet.rect.height))
+            return Response(sheet.get_pixmap(matrix=fitz.Matrix(scale,scale),alpha=False).tobytes('png'),media_type='image/png')
+    except (OSError,ValueError): return error('preview_failed','Could not render PDF.',422)

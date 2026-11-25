@@ -12,7 +12,7 @@ def fake_embedding(texts):
     return np.tile(np.array([1.,0.,0.],dtype=np.float32),(len(texts),1))
 
 def fake_generate(prompt):
-    if 'Organize' in prompt: return {'subtopics':[{'existing_id':None,'name':'Motion','description':'Motion models'}]}
+    if 'Organize' in prompt: return {'subtopics':[{'existing_id':None,'name':'Motion','description':'Motion models','size':5}]}
     import re
     return {'front':'What is motion?', 'back':'A change in position.', 'answer_leaked':False, 'source_chunk_ids':[int(re.search(r'\[chunk (\d+)\]',prompt).group(1))]}
 
@@ -178,12 +178,14 @@ def test_grade_count_tracks_answers_not_skips_or_retries():
             tree=next(x for x in c.get('/api/tree').json() if x['id']==course);t=tree['topics'][0]
             assert tree['graded_count']==t['graded_count']==t['subtopics'][0]['graded_count']==i+1
             expected=[j%2==0 for j in reversed(range(max(0,i-4),i+1))]
-            assert tree['recent_answers']==t['recent_answers']==t['subtopics'][0]['recent_answers']==expected
+            assert t['subtopics'][0]['recent_answers']==expected
+            progress={'known':sum(expected)/5,'again':(len(expected)-sum(expected))/5,'unanswered':(5-len(expected))/5}
+            assert tree['progress']==t['progress']==progress
         with study.lock:
             study.sessions[sid]['current']={'card_token':'skip','subtopic_id':sub['id'],'failed_id':None,'revision':t['index_revision']}
         study.grade(sid,'skip',None)
         final=next(x for x in c.get('/api/tree').json() if x['id']==course)
-        assert final['graded_count']==10 and final['recent_answers']==[False,True,False,True,False]
+        assert final['graded_count']==10 and final['progress']=={'known':.4,'again':.6,'unanswered':0.}
 
 
 def test_generated_reference_hides_old_prompt():
@@ -347,7 +349,7 @@ def test_text_uploads_bookmarks_and_independent_sessions(monkeypatch):
             ids.append(r.json()['files'][0]['id'])
         assert c.post(f'/api/topics/{topic}/files',files={'files':('binary.py',b'abc\x00xyz','text/plain')}).status_code==422
         assert 'def speed' in c.get(f'/api/files/{ids[0]}/preview').json()['content']
-        notebook=c.get(f'/api/files/{ids[2]}/preview').json()['content']
+        notebook='\n'.join(cell['content'] for cell in c.get(f'/api/files/{ids[2]}/preview').json()['cells'])
         assert 'speed = distance / time' in notebook and 'IGNORE_OUTPUT' not in notebook
         for _ in range(200):
             t=next(x for x in c.get('/api/tree').json() if x['id']==course)['topics'][0]
@@ -407,3 +409,79 @@ def test_text_uploads_bookmarks_and_independent_sessions(monkeypatch):
         assert repeated['front']==second['front']
         study.grade(deck,repeated['card_token'],True)
         assert study.next_card(deck)==('complete',None)
+
+
+def test_weighted_progress_indexing_and_pdf_preview(monkeypatch):
+    import secrets,hashlib,fitz
+    from pathlib import Path
+    from app.db import db,UPLOADS
+    monkeypatch.setattr(study,'prewarm',lambda:None)
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Weighted progress'}).json()['id']
+        topics=[c.post(f'/api/courses/{course}/topics',json={'name':name}).json()['id'] for name in ['One','Two']]
+        with db() as con:
+            subs=[]
+            for topic in topics:
+                con.execute("UPDATE topics SET index_status='processing' WHERE id=?",(topic,))
+                file=con.execute("INSERT INTO files(topic_id,original_name,storage_key,sha256,mime_type,size_bytes,status) VALUES(?,?,?,?,?,?,?)",(topic,'notes.txt','test-key',str(topic),'text/plain',10,'ready')).lastrowid
+                con.execute('INSERT INTO chunks(file_id,ordinal,content,embedding,embedding_model) VALUES(?,?,?,?,?)',(file,0,'Source facts.',np.array([1,0,0],dtype=np.float32).tobytes(),study.MODEL))
+                for i in range(2 if topic==topics[0] else 1):
+                    subs.append(con.execute('INSERT INTO subtopics(topic_id,name,description,size) VALUES(?,?,?,?)',(topic,str(i),'Facts',5 if topic==topics[0] else 1)).lastrowid)
+            for known in [True,True,False,False,False]:con.execute('INSERT INTO recent_grades(subtopic_id,known) VALUES(?,?)',(subs[0],known))
+            for known in [False,True]:con.execute('INSERT INTO recent_grades(subtopic_id,known) VALUES(?,?)',(subs[2],known))
+        tree=next(x for x in c.get('/api/tree').json() if x['id']==course)
+        assert tree['can_study'] and all(t['can_study'] for t in tree['topics'])
+        assert tree['topics'][0]['progress']=={'known':.2,'again':.3,'unanswered':.5}
+        assert tree['topics'][1]['subtopics'][0]['recent_answers']==[True]
+        assert tree['progress']=={'known':.6,'again':.15,'unanswered':.25}
+        sid=study.create('course',course)
+        with db() as con:
+            con.execute('UPDATE subtopics SET size=1 WHERE id=?',(subs[1],))
+            for sub in subs[:2]:con.execute('INSERT INTO saved_cards(subtopic_id,question_type,front,back,sources_json) VALUES(?,?,?,?,?)',(sub,'recall',str(sub),'Fact','[]'))
+        tree=next(x for x in c.get('/api/tree').json() if x['id']==course)
+        assert tree['topics'][0]['progress']=={'known':2/6,'again':3/6,'unanswered':1/6}
+        sid=study.create('topic',topics[0],True)
+        first=study.next_card(sid)[1]
+        state,upcoming=study.peek(sid,first['card_token'])
+        assert state=='ready' and upcoming['card_token']!=first['card_token']
+        assert study.next_card(sid)[1]['card_token']==first['card_token']
+        r=c.post(f'/api/sessions/{sid}/grade',json={'card_token':first['card_token'],'known':True,'advance':True}).json()
+        assert r['next_state']=='ready' and r['next_card']['card_token']==upcoming['card_token']
+        study.grade(sid,upcoming['card_token'],True)
+        assert study.next_card(sid)==('complete',None)
+        doc=fitz.open();page=doc.new_page();page.insert_text((72,72),'A real PDF page');body=doc.tobytes();doc.close()
+        key=secrets.token_hex(10);Path(UPLOADS,key).write_bytes(body)
+        with db() as con: fid=con.execute("INSERT INTO files(topic_id,original_name,storage_key,sha256,mime_type,size_bytes,status) VALUES(?,?,?,?,?,?,?)",(topics[0],'paper.pdf',key,hashlib.sha256(body).hexdigest(),'application/pdf',len(body),'ready')).lastrowid
+        assert c.get(f'/api/files/{fid}/preview').json()=={'kind':'pdf','pages':1}
+        image=c.get(f'/api/files/{fid}/pages/1')
+        assert image.status_code==200 and image.content.startswith(b'\x89PNG')
+        assert c.get(f'/api/files/{fid}/pages/2').status_code==404
+        sid=study.create('topic',topics[0])
+        with study.lock:
+            study.sessions[sid]['current']={'card_token':'survives-indexing','subtopic_id':subs[0],'failed_id':None,'revision':0,'topic_id':topics[0],'question_type':'recall','front':'A question','back':'A fact','sources':[{'file_id':fid}]}
+        with db() as con:con.execute('UPDATE topics SET index_revision=index_revision+1 WHERE id=?',(topics[0],))
+        assert study.grade(sid,'survives-indexing',True)[0]=='ok'
+
+
+def test_material_detail_selection(monkeypatch):
+    from app import material
+    from app.db import db
+    pending=[];prompts=[]
+    monkeypatch.setattr(material.executor,'submit',lambda fn,job:pending.append(job))
+    monkeypatch.setattr(ingestion,'schedule',lambda topic:None)
+    def generate(prompt):
+        prompts.append(prompt)
+        return {'material':'# Bloom filters\nA Bloom filter is a probabilistic set-membership structure with false positives but no false negatives.','focus':{'scope':'single','name':'Bloom filters'}}
+    monkeypatch.setattr(material,'generate',generate)
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Detail selector'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Filters'}).json()['id']
+        for size in ['small','medium','large']:
+            result=c.post(f'/api/topics/{topic}/generate-material',json={'description':'Bloom filters','size':size})
+            assert result.status_code==202
+            with db() as con: assert con.execute('SELECT material_size FROM material_generations WHERE id=?',(result.json()['generation_id'],)).fetchone()[0]==size
+            material._run(result.json()['generation_id'])
+        assert all(text in prompt for text,prompt in zip(['one distinct question','about five distinct questions','about ten distinct questions'],prompts))
+        assert c.post(f'/api/topics/{topic}/generate-material',json={'description':'Bloom filters','size':'huge'}).status_code==400
