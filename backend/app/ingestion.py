@@ -29,7 +29,7 @@ def recover():
         c.execute("UPDATE ingestion_jobs SET status='interrupted',error='Interrupted by restart',updated_at=CURRENT_TIMESTAMP WHERE status IN ('queued','running')")
     for id in ids: enqueue(id)
 
-def extract(file):
+def extract(file,preview=False):
     path = os.path.join(UPLOADS, file['storage_key'])
     ext = os.path.splitext(file['original_name'])[1].lower()
     units = []
@@ -49,12 +49,16 @@ def extract(file):
             with open(path, encoding='utf-8-sig') as f: text = f.read()
             if file.get('generated_description'):
                 text=generated_reference(text,file['generated_description'],generated_filename(file['original_name'],file['generated_description'],file.get('requested_name'),file.get('concept_name')))
+            if ext=='.ipynb':
+                notebook=json.loads(text)
+                text='\n\n'.join(''.join(cell.get('source',[])) if isinstance(cell.get('source',[]),list) else str(cell.get('source','')) for cell in notebook.get('cells',[]) if cell.get('cell_type') in ('code','markdown','raw'))
             lines=text.splitlines()
         except UnicodeDecodeError: raise ValueError('Text files must use UTF-8 encoding.')
         if not any(line.strip() for line in lines): raise ValueError('The file contains no text.')
         for start in range(0,len(lines),24):
             text='\n'.join(lines[start:start+24]).strip()
             if text: units.append((text,None,start+1,min(start+24,len(lines))))
+    if preview: return "\n\n".join(unit[0] for unit in units)
     chunks = []
     for text,page,line_start,line_end in units:
         words=text.split()

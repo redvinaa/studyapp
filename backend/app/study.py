@@ -19,15 +19,20 @@ def eligible(c, scope, id):
     if not where: return []
     return [dict(r) for r in c.execute(f"SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE {where} AND s.active=1 AND t.index_status IN ('ready','error') AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready')",(id,))]
 
-def create(scope,id):
+def create(scope,id,saved_only=False):
     with db() as c:
         subs=eligible(c,scope,id)
     if not subs: raise ValueError('There is no indexed material to study in this selection.')
     prewarm()
     with lock:
-        sessions.clear()
+        for old in list(sessions):
+            if time.monotonic()-sessions[old]['last']>3600: sessions.pop(old,None)
+        if saved_only:
+            with db() as c:
+                if not any(c.execute('SELECT 1 FROM saved_cards WHERE subtopic_id=?',(sub['id'],)).fetchone() for sub in subs):
+                    raise ValueError('No saved cards in this selection.')
         sid=secrets.token_urlsafe(24)
-        sessions[sid]={'scope':scope,'id':id,'current':None,'recent':[],'cooldown':{},'count':0,'last':time.monotonic(),'last_grade':None,'generating':False,'error':None,'queue':[]}
+        sessions[sid]={'scope':scope,'id':id,'saved_only':saved_only,'saved_recent':[],'current':None,'recent':[],'cooldown':{},'count':0,'last':time.monotonic(),'last_grade':None,'generating':False,'error':None,'queue':[]}
     return sid
 
 def get(sid):
@@ -55,7 +60,9 @@ def _make(sub, recent):
             f"The question must be completely standalone: never refer to the source, document, exercise, dataset, line number, figure, table, previous task, or any unseen context. "
             f"If the source describes a specific exercise, turn it into a general conceptual question or include all needed facts directly in the front. "
             f"The subject name may already be visible, so do not ask the learner to guess the subject name. "
-            f"Both front and back may use Markdown, tables, code and LaTeX. Give a self-contained answer with reasoning where needed. "
+            f"Test exactly ONE atomic piece of relevant information: one fact, relationship, step, or small calculation. Never ask for an overview, a list of properties, or multiple parts. "
+            f"Keep the front under 45 words and back under 80 words, preferably 1–3 short sentences. Include only reasoning needed for this one answer. "
+            f"Both front and back may use Markdown, code and LaTeX. Favor short text that fits a vertical mobile card. "
             f"Avoid these recent questions: {json.dumps(recent[-10:])}. Before responding, check whether the front reveals the answer; "
             f"rewrite it if so. Return JSON only: {{\"front\":\"...\",\"back\":\"...\",\"answer_leaked\":false,\"source_chunk_ids\":[]}}. "
             f"The citation array must contain at least one integer ID copied from this exact set: {json.dumps([r['id'] for r in selected])}. "
@@ -164,7 +171,16 @@ def next_card(sid):
             ids=[x['id'] for x in subs]
             marks=','.join('?' for _ in ids)
             failed=[dict(r) for r in c.execute(f'SELECT f.*,s.name subtopic_name,s.topic_id,t.index_revision FROM failed_cards f JOIN subtopics s ON s.id=f.subtopic_id JOIN topics t ON t.id=s.topic_id WHERE f.subtopic_id IN ({marks})',ids) if s['count']-s['cooldown'].get(r['id'],-999)>=int(os.getenv('RETRY_COOLDOWN','5'))]
-        if failed and random.random()<float(os.getenv('RETRY_PROBABILITY','0.3')):
+        saved_mode=s.get('saved_only',False)
+        if saved_mode:
+            with db() as c:
+                pool=[dict(r) for r in c.execute(f'SELECT f.*,s.name subtopic_name,s.topic_id,t.index_revision FROM saved_cards f JOIN subtopics s ON s.id=f.subtopic_id JOIN topics t ON t.id=s.topic_id WHERE f.subtopic_id IN ({marks})',ids)]
+            if not pool: return 'error','No saved cards remain in this selection.'
+            choices=[x for x in pool if x['id'] not in s['saved_recent']] or pool
+            f=random.choice(choices)
+            s['saved_recent']=(s['saved_recent']+[f['id']])[-max(1,len(pool)-1):]
+            card={'subtopic_id':f['subtopic_id'],'subtopic_name':f['subtopic_name'],'question_type':f['question_type'],'front':f['front'],'back':f['back'],'sources':json.loads(f['sources_json']),'failed_id':None,'revision':f['index_revision'],'topic_id':f['topic_id']}
+        elif failed and random.random()<float(os.getenv('RETRY_PROBABILITY','0.3')):
             f=random.choice(failed)
             sources=json.loads(f['sources_json'])
             with db() as c:
@@ -182,6 +198,8 @@ def next_card(sid):
                 return 'loading',None
             sub=random.choices(ready,weights=[1-x['proficiency']+0.1 for x in ready],k=1)[0]
             card=prefetched[sub['id']]['queue'].pop(0)
+        with db() as c:
+            card['saved']=bool(c.execute('SELECT 1 FROM saved_cards WHERE subtopic_id=? AND front=? AND back=?',(card['subtopic_id'],card['front'],card['back'])).fetchone())
         card['card_token']=secrets.token_urlsafe(24)
         s['current']=card
         s['recent']=(s['recent']+[card['front']])[-10:]
@@ -216,3 +234,16 @@ def grade(sid, token, known=None):
         result={'proficiency':p,'failed_count':count}
         s['last_grade']=(token,result); s['current']=None
         return 'ok',result
+
+def bookmark(sid,token,saved):
+    with lock:
+        session=get(sid)
+        card=session and session['current']
+        if not card or card['card_token']!=token: return 'stale',None
+        with db() as c:
+            if saved:
+                c.execute('INSERT OR IGNORE INTO saved_cards(subtopic_id,question_type,front,back,sources_json) VALUES(?,?,?,?,?)',(card['subtopic_id'],card['question_type'],card['front'],card['back'],json.dumps(card['sources'])))
+            else:
+                c.execute('DELETE FROM saved_cards WHERE subtopic_id=? AND front=? AND back=?',(card['subtopic_id'],card['front'],card['back']))
+        card['saved']=saved
+        return 'ok',{'saved':saved}

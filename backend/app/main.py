@@ -57,6 +57,7 @@ def me(): return {'authenticated':True}
 @app.get('/api/tree')
 def tree():
     with db() as c:
+        saved_counts={r['subtopic_id']:r['n'] for r in c.execute('SELECT subtopic_id,COUNT(*) n FROM saved_cards GROUP BY subtopic_id')}
         grades={}
         for row in c.execute('SELECT id,subtopic_id,known FROM recent_grades ORDER BY id DESC'):
             grades.setdefault(row['subtopic_id'],[]).append((row['id'],bool(row['known'])))
@@ -67,6 +68,7 @@ def tree():
             for topic in course['topics']:
                 topic['subtopics']=[dict(r) for r in c.execute('SELECT id,name,description,proficiency,graded_count FROM subtopics WHERE topic_id=? AND active=1 ORDER BY name COLLATE NOCASE',(topic['id'],))]
                 for subtopic in topic['subtopics']:
+                    subtopic['saved_count']=saved_counts.get(subtopic['id'],0)
                     subtopic['recent_answers']=[x[1] for x in grades.get(subtopic['id'],[])[:5]]
                 topic['files']=[dict(r) for r in c.execute('SELECT f.id,f.original_name,f.size_bytes,f.status,f.error,(SELECT g.description FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS generated_description,(SELECT g.requested_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS requested_name,(SELECT g.concept_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS concept_name FROM files f WHERE f.topic_id=? ORDER BY f.id',(topic['id'],))]
                 for file in topic['files']:
@@ -75,12 +77,14 @@ def tree():
                     if description: file['original_name']=generated_filename(file['original_name'],description,requested,concept)
                 topic['generations']=[dict(r) for r in c.execute("SELECT id,status,error FROM material_generations WHERE topic_id=? AND status IN ('queued','running','failed') ORDER BY id",(topic['id'],))]
                 vs=[s['proficiency'] for s in topic['subtopics']]; values.extend(vs)
+                topic['saved_count']=sum(s['saved_count'] for s in topic['subtopics'])
                 topic['graded_count']=sum(s['graded_count'] for s in topic['subtopics'])
                 topic_grades=sorted((g for sub in topic['subtopics'] for g in grades.get(sub['id'],[])),reverse=True)
                 topic['recent_answers']=[x[1] for x in topic_grades[:5]]
                 topic['_grade_order']=topic_grades[:5]
                 topic['proficiency']=sum(vs)/len(vs) if vs else None
             course['proficiency']=sum(values)/len(values) if values else None
+            course['saved_count']=sum(t['saved_count'] for t in course['topics'])
             course['graded_count']=sum(t['graded_count'] for t in course['topics'])
             course_grades=sorted((g for t in course['topics'] for g in t.pop('_grade_order')),reverse=True)
             course['recent_answers']=[x[1] for x in course_grades[:5]]
@@ -144,7 +148,6 @@ async def upload(topic_id:int,files:list[UploadFile]=File(...)):
         name=f.filename or ''
         if not name or '/' in name or '\\' in name or name in ('.','..'): return error('invalid_filename','Invalid file name.',422)
         ext=Path(name).suffix.lower()
-        if ext not in ('.pdf','.md','.txt'): return error('invalid_type','Use a PDF, Markdown, or text file.',422)
         key=secrets.token_hex(24); temp=Path(UPLOADS,key+'.tmp'); final=Path(UPLOADS,key)
         size=0; digest=hashlib.sha256()
         try:
@@ -156,7 +159,14 @@ async def upload(topic_id:int,files:list[UploadFile]=File(...)):
             if size==0: return error('empty_file','The file is empty.',422)
             with temp.open('rb') as inp: prefix=inp.read(1024)
             if ext=='.pdf' and not prefix.startswith(b'%PDF-'): return error('invalid_content','This is not a valid PDF.',422)
-            if ext!='.pdf' and b'\x00' in prefix: return error('invalid_content','This is not a valid text file.',422)
+            if ext!='.pdf':
+                try:
+                    text=temp.read_text(encoding='utf-8-sig')
+                    if any(ord(ch)<32 and ch not in '\t\r\n\f' for ch in text): raise ValueError()
+                    if ext=='.ipynb':
+                        notebook=json.loads(text)
+                        if not isinstance(notebook.get('cells'),list) or not all(isinstance(cell,dict) and (isinstance(cell.get('source',[]),str) or isinstance(cell.get('source',[]),list) and all(isinstance(line,str) for line in cell['source'])) for cell in notebook['cells']): raise ValueError()
+                except (UnicodeError,ValueError,AttributeError): return error('invalid_content','Upload a UTF-8 text file or PDF.',422)
             with db() as c:
                 existing=c.execute('SELECT id FROM files WHERE topic_id=? AND sha256=?',(topic_id,digest.hexdigest())).fetchone()
                 if existing: added.append({'id':existing['id'],'duplicate':True}); continue
@@ -235,7 +245,7 @@ def job(job_id:int):
 @app.post('/api/sessions')
 async def create_session(request:Request):
     try:
-        data=await request.json(); sid=study.create(data.get('scope_type'),int(data.get('scope_id')))
+        data=await request.json(); sid=study.create(data.get('scope_type'),int(data.get('scope_id')),data.get('saved_only') is True)
         return {'id':sid}
     except (ValueError,TypeError): return error('empty_scope','There is no indexed material to study in this selection.',400)
 @app.get('/api/sessions/{sid}/next')
@@ -259,3 +269,23 @@ async def grade(sid:str,request:Request):
 def end_session(sid:str):
     with study.lock: study.sessions.pop(sid,None)
     return {'ok':True}
+
+@app.post('/api/sessions/{sid}/bookmark')
+async def bookmark(sid:str,request:Request):
+    try:
+        data=await request.json()
+        if not isinstance(data['saved'],bool): raise ValueError()
+        state,result=study.bookmark(sid,data['card_token'],data['saved'])
+    except (KeyError,ValueError,TypeError): return error('invalid_request','Invalid bookmark.',400)
+    if state!='ok': return error('stale_session','This card is no longer current.',409)
+    return result
+
+@app.get('/api/files/{file_id}/preview')
+def preview(file_id:int):
+    with db() as c: row=c.execute('SELECT f.*,(SELECT g.description FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS generated_description,(SELECT g.requested_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS requested_name,(SELECT g.concept_name FROM material_generations g WHERE g.file_id=f.id ORDER BY g.id DESC LIMIT 1) AS concept_name FROM files f WHERE f.id=?',(file_id,)).fetchone()
+    if not row: return error('not_found','File not found.',404)
+    file=dict(row)
+    try:
+        content=ingestion.extract(file,preview=True)
+    except (ValueError,OSError) as e: return error('preview_failed',str(e),422)
+    return {'content':content[:500000],'truncated':len(content)>500000}

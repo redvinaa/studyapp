@@ -331,3 +331,46 @@ def test_card_retries_invalid_citation_id(monkeypatch):
         card=study._make(sub,[])
         assert len(calls)==2 and card['sources']
         assert 'copied from this exact set' in calls[0]
+
+
+def test_text_uploads_bookmarks_and_independent_sessions():
+    import json
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Saved and source files'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Code'}).json()['id']
+        files=[('example.py',b'def speed(distance, time):\n    return distance / time\n'),('page.html',b'<h1>Motion</h1>'),('notebook.ipynb',json.dumps({'cells':[{'cell_type':'markdown','source':['Motion means a change in position.']},{'cell_type':'code','source':['speed = distance / time'],'outputs':[{'text':'IGNORE_OUTPUT'}]}]}).encode())]
+        ids=[]
+        for name,body in files:
+            r=c.post(f'/api/topics/{topic}/files',files={'files':(name,body,'application/octet-stream')})
+            assert r.status_code==202,r.text
+            ids.append(r.json()['files'][0]['id'])
+        assert c.post(f'/api/topics/{topic}/files',files={'files':('binary.py',b'abc\x00xyz','text/plain')}).status_code==422
+        assert 'def speed' in c.get(f'/api/files/{ids[0]}/preview').json()['content']
+        notebook=c.get(f'/api/files/{ids[2]}/preview').json()['content']
+        assert 'speed = distance / time' in notebook and 'IGNORE_OUTPUT' not in notebook
+        for _ in range(200):
+            t=next(x for x in c.get('/api/tree').json() if x['id']==course)['topics'][0]
+            if t['index_status']=='ready': break
+            time.sleep(.05)
+        assert t['index_status']=='ready',t
+        sid=study.create('topic',topic)
+        sub=t['subtopics'][0]
+        card={'card_token':'saved-token','subtopic_id':sub['id'],'failed_id':None,'revision':t['index_revision'],'topic_id':topic,'question_type':'recall','front':'What is speed?','back':'Distance per unit time.','sources':[]}
+        with study.lock: study.sessions[sid]['current']=card
+        second=study.create('topic',topic)
+        assert study.get(sid) is not None and study.get(second) is not None
+        for _ in range(2):
+            r=c.post(f'/api/sessions/{sid}/bookmark',json={'card_token':'saved-token','saved':True})
+            assert r.status_code==200 and r.json()['saved']
+        tree=next(x for x in c.get('/api/tree').json() if x['id']==course)
+        assert tree['saved_count']==tree['topics'][0]['saved_count']==tree['topics'][0]['subtopics'][0]['saved_count']==1
+        saved_sid=c.post('/api/sessions',json={'scope_type':'topic','scope_id':topic,'saved_only':True}).json()['id']
+        review=c.get(f'/api/sessions/{saved_sid}/next').json()
+        assert review['front']==card['front'] and review['saved']
+        assert c.post(f'/api/sessions/{saved_sid}/grade',json={'card_token':review['card_token'],'known':True}).status_code==200
+        assert c.get(f'/api/sessions/{saved_sid}/next').json()['front']==card['front']
+        assert c.post(f'/api/sessions/{sid}/grade',json={'card_token':'saved-token','known':True}).status_code==200
+        review=c.get(f'/api/sessions/{saved_sid}/next').json()
+        assert c.post(f'/api/sessions/{saved_sid}/bookmark',json={'card_token':review['card_token'],'saved':False}).status_code==200
+        assert next(x for x in c.get('/api/tree').json() if x['id']==course)['saved_count']==0
