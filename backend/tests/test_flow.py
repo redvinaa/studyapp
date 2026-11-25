@@ -579,3 +579,40 @@ def test_flagged_cards_are_excluded_and_pending_questions_are_visible(monkeypatc
             assert pending['busy'] and pending['messages'][-1]=={'role':'user','content':'Why does this happen?'}
         finally:release.set();worker.join(3)
         assert result[0][0]=='ok' and len(result[0][1]['messages'])==2
+
+
+def test_subtopic_retrieval_keeps_exact_membership_evidence(monkeypatch):
+    queries=[]
+    def embed(texts):
+        queries.extend(texts)
+        return np.array([[1.,0.,0.]],dtype=np.float32)
+    monkeypatch.setattr(study,'embeddings',embed)
+    subject={'name':'Exact set-membership data structures','description':'Sorted arrays, trees and hash tables provide exact membership testing rather than approximate membership prechecks.'}
+    rows=[]
+    for index in range(8):
+        rows.append({'id':index,'content':'Bloom filters provide probabilistic set-membership testing with false positives.',
+                     'embedding_model':study.MODEL,'embedding':np.array([.6,0.,0.],dtype=np.float32).tobytes()})
+    rows.append({'id':31,'content':'Sorted array with binary search: O(log n) lookup. Balanced binary search tree: O(log n) lookup and updates. Hash table: expected O(1) lookup; compare full keys on collisions.',
+                 'embedding_model':study.MODEL,'embedding':np.array([.47,0.,0.],dtype=np.float32).tobytes()})
+    selected=study._select_sources(subject,rows)
+    assert selected[0]['id']==31
+    assert queries==[subject['name']+' '+subject['description']]
+
+
+def test_insufficient_card_evidence_is_not_reported_as_malformed(monkeypatch):
+    import pytest
+    from app.db import db
+    monkeypatch.setattr(study,'prewarm',lambda:None)
+    monkeypatch.setattr(study,'generate',lambda prompt:{'error':'insufficient_context'})
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Evidence errors'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Motion'}).json()['id']
+        c.post(f'/api/topics/{topic}/files',files={'files':('notes.txt',b'Motion is change in position over time.','text/plain')})
+        for _ in range(100):
+            t=next(x for x in c.get('/api/tree').json() if x['id']==course)['topics'][0]
+            if t['index_status'] in ('ready','error'):break
+            time.sleep(.05)
+        with db() as con:subject=study.eligible(con,'topic',topic)[0]
+        with pytest.raises(ValueError,match='Not enough source evidence'):
+            study._make(subject,[])
