@@ -12,6 +12,7 @@ def fake_embedding(texts):
     return np.tile(np.array([1.,0.,0.],dtype=np.float32),(len(texts),1))
 
 def fake_generate(prompt):
+    if 'Distill code into study evidence' in prompt:return {'chunks':[{'index':0,'notes':'Motion is a change in position over time.'}]}
     if 'Organize' in prompt: return {'subtopics':[{'existing_id':None,'name':'Motion','description':'Motion models','size':5}]}
     import re
     return {'front':'What is motion?', 'back':'A change in position.', 'answer_leaked':False, 'source_chunk_ids':[int(re.search(r'\[chunk (\d+)\]',prompt).group(1))]}
@@ -485,3 +486,96 @@ def test_material_detail_selection(monkeypatch):
             material._run(result.json()['generation_id'])
         assert all(text in prompt for text,prompt in zip(['one distinct question','about five distinct questions','about ten distinct questions'],prompts))
         assert c.post(f'/api/topics/{topic}/generate-material',json={'description':'Bloom filters','size':'huge'}).status_code==400
+
+
+def test_html_indexing_uses_readable_content_and_recovers_invalid_json(monkeypatch):
+    calls=[]
+    def generate(prompt):
+        if 'Organize' in prompt and 'HTML relevance' in prompt:
+            calls.append(prompt)
+            if len(calls)<3:raise ValueError('AI returned invalid JSON. Please retry.')
+        return fake_generate(prompt)
+    monkeypatch.setattr(ingestion,'generate',generate)
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'HTML relevance'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Bloom filters'}).json()['id']
+        html=b'<html><head><style>CSS_BOILERPLATE</style><script>JS_BOILERPLATE</script></head><body><nav>NAVIGATION</nav><main><h1>Bloom filters</h1><p>Hash functions set positions in a bit array.</p></main><footer>FOOTER</footer></body></html>'
+        r=c.post(f'/api/topics/{topic}/files',files={'files':('lecture.html',html,'text/html')})
+        assert r.status_code==202
+        for _ in range(200):
+            t=next(row for row in c.get('/api/tree').json() if row['id']==course)['topics'][0]
+            if t['index_status'] in ('ready','error'):break
+            time.sleep(.05)
+        assert t['index_status']=='ready',t
+        assert len(calls)==3 and 'bit array' in calls[0]
+        assert not any(text in calls[0] for text in ['CSS_BOILERPLATE','JS_BOILERPLATE','NAVIGATION','FOOTER'])
+        preview=c.get(f"/api/files/{r.json()['files'][0]['id']}/preview").json()
+        assert preview['kind']=='html' and '<h1>Bloom filters</h1>' in preview['content']
+
+
+def test_code_relevance_preserves_source_references():
+    from app.code_context import relevant_code
+    source=[('import matplotlib; plt.title("Chart")',None,None,1,10),('for h in hashes: bits[h(item)] = 1',None,None,11,20)]
+    prompts=[]
+    def generate(prompt):
+        prompts.append(prompt)
+        return {'chunks':[{'index':1,'notes':'Insertion sets a bit for each hash of the item.'}]}
+    result=relevant_code(source,'lab.py','Data Engineering','Bloom filters',generate)
+    assert result==[('Insertion sets a bit for each hash of the item.',None,None,11,20)]
+    assert 'Bloom filters' in prompts[0] and 'plotting' in prompts[0]
+    assert relevant_code(source,'lab.py','Data Engineering','Bloom filters',lambda _: {'chunks':[]})==[]
+
+
+def test_flagged_cards_are_excluded_and_pending_questions_are_visible(monkeypatch):
+    from app.db import db
+    import threading
+    monkeypatch.setattr(study,'prewarm',lambda:None)
+    with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
+        c.post('/api/login',json={'password':'correct'})
+        course=c.post('/api/courses',json={'name':'Feedback'}).json()['id']
+        topic=c.post(f'/api/courses/{course}/topics',json={'name':'Relevant concepts'}).json()['id']
+        with db() as con:
+            con.execute("UPDATE topics SET index_status='ready' WHERE id=?",(topic,))
+            fid=con.execute("INSERT INTO files(topic_id,original_name,storage_key,sha256,mime_type,size_bytes,status) VALUES(?,?,?,?,?,?,?)",(topic,'reference.md','feedback','feedback','text/plain',10,'ready')).lastrowid
+            chunk=con.execute('INSERT INTO chunks(file_id,ordinal,content,embedding,embedding_model) VALUES(?,?,?,?,?)',(fid,0,'Motion is a change in position.',np.array([1,0,0],dtype=np.float32).tobytes(),study.MODEL)).lastrowid
+            sub=con.execute('INSERT INTO subtopics(topic_id,name,description,size) VALUES(?,?,?,?)',(topic,'Motion','Position changes',5)).lastrowid
+            for front in ['Which logging function is called?','What is motion?']:con.execute('INSERT INTO saved_cards(subtopic_id,question_type,front,back,sources_json) VALUES(?,?,?,?,?)',(sub,'recall',front,'A fact.','[]'))
+        sid=study.create('topic',topic,True)
+        first=study.next_card(sid)[1]
+        upcoming=study.peek(sid,first['card_token'])[1]
+        report=c.post(f'/api/sessions/{sid}/irrelevant',json={'card_token':first['card_token']})
+        assert report.status_code==200,report.text
+        assert report.json()['next_card']['card_token']==upcoming['card_token']
+        assert c.post(f'/api/sessions/{sid}/irrelevant',json={'card_token':first['card_token']}).json()['report_id']==report.json()['report_id']
+        tree=next(row for row in c.get('/api/tree').json() if row['id']==course)
+        assert tree['graded_count']==0 and tree['saved_count']==1
+        calls=[]
+        def generate(prompt):
+            calls.append(prompt)
+            return {'front':first['front'] if len(calls)==1 else 'What concept relates distance and time?','back':'Speed.','answer_leaked':False,'source_chunk_ids':[chunk]}
+        monkeypatch.setattr(study,'generate',generate)
+        with db() as con:subject=dict(con.execute('SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE s.id=?',(sub,)).fetchone())
+        fresh=study._make(subject,[])
+        assert fresh['front']!=first['front'] and len(calls)==2
+        assert first['front'] in calls[0] and 'Relevant concepts' in calls[0]
+        study.grade(sid,upcoming['card_token'],True)
+        assert study.next_card(sid)==('complete',None)
+        next_sid=study.create('topic',topic,True)
+        current=study.next_card(next_sid)[1]
+        assert current['front']!=first['front']
+        assert c.delete('/api/irrelevant-cards/'+str(report.json()['report_id'])).status_code==200
+        assert next(row for row in c.get('/api/tree').json() if row['id']==course)['saved_count']==2
+        started=threading.Event();release=threading.Event();result=[]
+        def slow_generate(prompt):
+            started.set();assert release.wait(3)
+            return {'reply':'A concise explanation.'}
+        monkeypatch.setattr(study,'generate',slow_generate)
+        worker=threading.Thread(target=lambda:result.append(study.conversation(next_sid,current['card_token'],'Why does this happen?')))
+        worker.start()
+        try:
+            assert started.wait(3)
+            pending=c.get(f'/api/sessions/{next_sid}/conversation',params={'card_token':current['card_token']}).json()
+            assert pending['busy'] and pending['messages'][-1]=={'role':'user','content':'Why does this happen?'}
+        finally:release.set();worker.join(3)
+        assert result[0][0]=='ok' and len(result[0][1]['messages'])==2

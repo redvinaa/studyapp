@@ -62,7 +62,10 @@ def average_progress(children,weighted=False):
 @app.get('/api/tree')
 def tree():
     with db() as c:
-        saved_counts={r['subtopic_id']:r['n'] for r in c.execute('SELECT subtopic_id,COUNT(*) n FROM saved_cards GROUP BY subtopic_id')}
+        blocked={(r['topic_id'],r['fingerprint']) for r in c.execute('SELECT topic_id,fingerprint FROM irrelevant_cards')}
+        saved_counts={}
+        for row in c.execute('SELECT f.subtopic_id,f.front,s.topic_id FROM saved_cards f JOIN subtopics s ON s.id=f.subtopic_id'):
+            if (row['topic_id'],study.fingerprint(row['front'])) not in blocked:saved_counts[row['subtopic_id']]=saved_counts.get(row['subtopic_id'],0)+1
         grades={}
         for row in c.execute('SELECT id,subtopic_id,known FROM recent_grades ORDER BY id DESC'):
             grades.setdefault(row['subtopic_id'],[]).append((row['id'],bool(row['known'])))
@@ -299,6 +302,8 @@ def preview(file_id:int):
     if not row: return error('not_found','File not found.',404)
     file=dict(row)
     try:
+        if Path(file['original_name']).suffix.lower() in ('.html','.htm'):
+            return {'kind':'html','content':Path(UPLOADS,file['storage_key']).read_text(encoding='utf-8-sig')}
         if Path(file['original_name']).suffix.lower()=='.pdf':
             import fitz
             with fitz.open(Path(UPLOADS,file['storage_key'])) as doc:
@@ -360,3 +365,19 @@ def pdf_page(file_id:int,page:int):
             scale=min(1.7,1800/max(sheet.rect.width,sheet.rect.height))
             return Response(sheet.get_pixmap(matrix=fitz.Matrix(scale,scale),alpha=False).tobytes('png'),media_type='image/png')
     except (OSError,ValueError): return error('preview_failed','Could not render PDF.',422)
+
+
+@app.post('/api/sessions/{sid}/irrelevant')
+async def report_card(sid:str,request:Request):
+    try:
+        data=await request.json()
+        state,result=study.report_irrelevant(sid,data['card_token'])
+    except (ValueError,KeyError,TypeError):return error('invalid_request','Invalid card.',400)
+    if state!='ok':return error('stale_session','This card is no longer current.',409)
+    next_state,next_card=study.next_card(sid)
+    return {**result,'next_state':next_state,'next_card':next_card if next_state=='ready' else None}
+
+@app.delete('/api/irrelevant-cards/{report_id}')
+def undo_irrelevant(report_id:int):
+    with db() as c:c.execute('DELETE FROM irrelevant_cards WHERE id=?',(report_id,))
+    return {'ok':True}
