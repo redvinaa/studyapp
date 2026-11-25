@@ -253,6 +253,7 @@ def next_card(sid:str):
     state,card=study.next_card(sid)
     if state=='expired': return error('session_expired','Session expired. Start a new session.',409)
     if state=='error': return error('generation_failed',card,503)
+    if state=='complete': return {'status':'complete'}
     if state=='loading': return JSONResponse({'status':'generating'},status_code=202)
     return card
 @app.post('/api/sessions/{sid}/grade')
@@ -289,3 +290,24 @@ def preview(file_id:int):
         content=ingestion.extract(file,preview=True)
     except (ValueError,OSError) as e: return error('preview_failed',str(e),422)
     return {'content':content[:500000],'truncated':len(content)>500000}
+
+
+@app.get('/api/sessions/{sid}/conversation')
+def get_conversation(sid:str,card_token:str):
+    state,result=study.conversation(sid,card_token)
+    if state!='ok': return error('stale_session','This card is no longer current.',409)
+    return result
+
+@app.post('/api/sessions/{sid}/conversation')
+async def ask(sid:str,request:Request):
+    from starlette.concurrency import run_in_threadpool
+    try:
+        data=await request.json()
+        token=data['card_token']; message=data['message']
+        if not isinstance(token,str) or not isinstance(message,str) or not 1<=len(message.strip())<=4000: raise ValueError()
+    except (ValueError,KeyError,TypeError): return error('invalid_request','Enter a question of up to 4,000 characters.',400)
+    try: state,result=await run_in_threadpool(study.conversation,sid,token,message.strip())
+    except Exception: return error('conversation_failed','Could not get an answer. Please try again.',503)
+    if state=='busy': return error('conversation_busy','An answer is already being prepared.',409)
+    if state!='ok': return error('stale_session','This card is no longer current.',409)
+    return result

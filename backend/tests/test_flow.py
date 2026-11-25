@@ -333,7 +333,7 @@ def test_card_retries_invalid_citation_id(monkeypatch):
         assert 'copied from this exact set' in calls[0]
 
 
-def test_text_uploads_bookmarks_and_independent_sessions():
+def test_text_uploads_bookmarks_and_independent_sessions(monkeypatch):
     import json
     with TestClient(app,base_url='https://testserver',headers={'origin':'https://testserver'}) as c:
         c.post('/api/login',json={'password':'correct'})
@@ -368,9 +368,42 @@ def test_text_uploads_bookmarks_and_independent_sessions():
         saved_sid=c.post('/api/sessions',json={'scope_type':'topic','scope_id':topic,'saved_only':True}).json()['id']
         review=c.get(f'/api/sessions/{saved_sid}/next').json()
         assert review['front']==card['front'] and review['saved']
-        assert c.post(f'/api/sessions/{saved_sid}/grade',json={'card_token':review['card_token'],'known':True}).status_code==200
-        assert c.get(f'/api/sessions/{saved_sid}/next').json()['front']==card['front']
+        assert c.post(f'/api/sessions/{saved_sid}/grade',json={'card_token':review['card_token'],'known':False}).status_code==200
+        repeated=c.get(f'/api/sessions/{saved_sid}/next').json()
+        assert repeated['front']==card['front']
+        assert c.post(f'/api/sessions/{saved_sid}/grade',json={'card_token':repeated['card_token'],'known':True}).status_code==200
+        assert c.get(f'/api/sessions/{saved_sid}/next').json()=={'status':'complete'}
+        prompts=[]
+        def explain(prompt):
+            if 'CARD QUESTION:' not in prompt: return fake_generate(prompt)
+            prompts.append(prompt)
+            return {'reply':'Speed measures distance per unit time.'}
+        monkeypatch.setattr(study,'generate',explain)
+        path=f'/api/sessions/{sid}/conversation'
+        assert c.get(path,params={'card_token':'saved-token'}).json()['messages']==[]
+        for message in ['What does this mean?','Show an example.']:
+            response=c.post(path,json={'card_token':'saved-token','message':message})
+            assert response.status_code==200,response.text
+        assert len(response.json()['messages'])==4
+        assert 'def speed' in prompts[0] and 'What is speed?' in prompts[0]
+        assert 'What does this mean?' in prompts[1] and 'Speed measures distance' in prompts[1]
+        assert len(c.get(path,params={'card_token':'saved-token'}).json()['messages'])==4
+        assert c.post(path,json={'card_token':'wrong','message':'Explain'}).status_code==409
+        assert c.post(f'/api/sessions/{sid}/bookmark',json={'card_token':'saved-token','saved':False}).status_code==200
         assert c.post(f'/api/sessions/{sid}/grade',json={'card_token':'saved-token','known':True}).status_code==200
-        review=c.get(f'/api/sessions/{saved_sid}/next').json()
-        assert c.post(f'/api/sessions/{saved_sid}/bookmark',json={'card_token':review['card_token'],'saved':False}).status_code==200
         assert next(x for x in c.get('/api/tree').json() if x['id']==course)['saved_count']==0
+        from app.db import db
+        with db() as con:
+            for front in ['What is velocity?','What is acceleration?']:
+                con.execute('INSERT INTO saved_cards(subtopic_id,question_type,front,back,sources_json) VALUES(?,?,?,?,?)',(sub['id'],'recall',front,'A single fact.','[]'))
+        deck=study.create('topic',topic,True)
+        first=study.next_card(deck)[1]
+        assert study.grade(deck,first['card_token'],True)[0]=='ok'
+        second=study.next_card(deck)[1]
+        assert second['front']!=first['front']
+        assert study.grade(deck,second['card_token'],False)[0]=='ok'
+        assert study.grade(deck,second['card_token'],False)[0]=='ok'
+        repeated=study.next_card(deck)[1]
+        assert repeated['front']==second['front']
+        study.grade(deck,repeated['card_token'],True)
+        assert study.next_card(deck)==('complete',None)
