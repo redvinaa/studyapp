@@ -27,7 +27,31 @@ def is_irrelevant(card):
 def eligible(c, scope, id):
     where={'course':'t.course_id=?','topic':'s.topic_id=?','subtopic':'s.id=?'}.get(scope)
     if not where: return []
-    return [dict(r) for r in c.execute(f"SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE {where} AND s.active=1 AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready')",(id,))]
+    subs=[dict(r) for r in c.execute(f"SELECT s.*,t.index_revision FROM subtopics s JOIN topics t ON t.id=s.topic_id WHERE {where} AND s.active=1 AND EXISTS(SELECT 1 FROM chunks ch JOIN files f ON f.id=ch.file_id WHERE f.topic_id=t.id AND f.status='ready')",(id,))]
+    by_id={sub['id']:sub for sub in subs}
+    for sub in subs:sub.update(answer_count=0,known_count=0)
+    if subs:
+        marks=','.join('?' for _ in subs)
+        for row in c.execute(f'SELECT subtopic_id,known FROM recent_grades WHERE subtopic_id IN ({marks}) ORDER BY id DESC',list(by_id)):
+            sub=by_id[row['subtopic_id']]
+            if sub['answer_count']<sub['size']:
+                sub['answer_count']+=1
+                sub['known_count']+=row['known']
+    return subs
+
+def _priority(subs):
+    slots=sum(sub['size'] for sub in subs)
+    unanswered=sum(sub['size']-sub['answer_count'] for sub in subs)/slots
+    failed=sum(sub['answer_count']-sub['known_count'] for sub in subs)/slots
+    # Keep mastered material in rotation while favoring gaps and mistakes.
+    return .25+2*unanswered+3*failed
+
+def _choose_subtopic(available, scope, all_subs):
+    if scope=='course':
+        topics=list(dict.fromkeys(sub['topic_id'] for sub in available))
+        topic=random.choices(topics,weights=[_priority([sub for sub in all_subs if sub['topic_id']==topic]) for topic in topics],k=1)[0]
+        available=[sub for sub in available if sub['topic_id']==topic]
+    return random.choices(available,weights=[_priority([sub]) for sub in available],k=1)[0]
 
 def create(scope,id,saved_only=False):
     with db() as c:
@@ -249,7 +273,9 @@ def next_card(sid):
             f=by_id[s['saved_queue'].pop(0)]
             card={'subtopic_id':f['subtopic_id'],'subtopic_name':f['subtopic_name'],'question_type':f['question_type'],'front':f['front'],'back':f['back'],'sources':json.loads(f['sources_json']),'failed_id':None,'revision':f['index_revision'],'topic_id':f['topic_id'],'saved_id':f['id']}
         elif failed and random.random()<float(os.getenv('RETRY_PROBABILITY','0.3')):
-            f=random.choice(failed)
+            failed_ids={card['subtopic_id'] for card in failed}
+            sub=_choose_subtopic([sub for sub in subs if sub['id'] in failed_ids],s['scope'],subs)
+            f=random.choice([card for card in failed if card['subtopic_id']==sub['id']])
             sources=json.loads(f['sources_json'])
             with db() as c:
                 for source in sources:
@@ -267,7 +293,7 @@ def next_card(sid):
                 errors=[prefetched[x['id']]['error'] for x in subs if x['id'] in prefetched and prefetched[x['id']]['error']]
                 if len(errors)==len(subs): return 'error',errors[0]
                 return 'loading',None
-            sub=random.choices(ready,weights=[1-x['proficiency']+0.1 for x in ready],k=1)[0]
+            sub=_choose_subtopic(ready,s['scope'],subs)
             card=prefetched[sub['id']]['queue'].pop(0)
         with db() as c:
             card['saved']=bool(c.execute('SELECT 1 FROM saved_cards WHERE subtopic_id=? AND front=? AND back=?',(card['subtopic_id'],card['front'],card['back'])).fetchone())

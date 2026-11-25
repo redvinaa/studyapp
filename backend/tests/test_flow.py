@@ -436,6 +436,9 @@ def test_weighted_progress_indexing_and_pdf_preview(monkeypatch):
         assert tree['topics'][0]['progress']=={'known':.2,'again':.3,'unanswered':.5}
         assert tree['topics'][1]['subtopics'][0]['recent_answers']==[True]
         assert tree['progress']=={'known':.6,'again':.15,'unanswered':.25}
+        with db() as con:
+            selection={sub['id']:sub for sub in study.eligible(con,'course',course)}
+        assert [(selection[sub]['answer_count'],selection[sub]['known_count']) for sub in subs]==[(5,2),(0,0),(1,1)]
         sid=study.create('course',course)
         with db() as con:
             con.execute('UPDATE subtopics SET size=1 WHERE id=?',(subs[1],))
@@ -616,3 +619,36 @@ def test_insufficient_card_evidence_is_not_reported_as_malformed(monkeypatch):
         with db() as con:subject=study.eligible(con,'topic',topic)[0]
         with pytest.raises(ValueError,match='Not enough source evidence'):
             study._make(subject,[])
+
+
+def test_study_priority_favors_unfilled_and_failed_recent_slots(monkeypatch):
+    mastered={'id':1,'topic_id':1,'size':5,'answer_count':5,'known_count':5}
+    unstudied={'id':2,'topic_id':1,'size':5,'answer_count':0,'known_count':0}
+    failed={'id':3,'topic_id':1,'size':5,'answer_count':5,'known_count':1}
+    assert study._priority([mastered])<study._priority([unstudied])<study._priority([failed])
+    assert study._priority([dict(unstudied,size=1)])==study._priority([unstudied])
+    calls=[]
+    def choose(population,weights,k):
+        calls.append((population,weights))
+        return [population[int(np.argmax(weights))]]
+    monkeypatch.setattr(study.random,'choices',choose)
+    assert study._choose_subtopic([mastered,unstudied,failed],'topic',[mastered,unstudied,failed])==failed
+    assert calls[0][1]==[study._priority([sub]) for sub in [mastered,unstudied,failed]]
+
+
+def test_course_priority_chooses_topic_before_subtopic(monkeypatch):
+    large=[{'id':i,'topic_id':1,'size':5,'answer_count':5,'known_count':5} for i in range(10)]
+    small=[{'id':20,'topic_id':2,'size':1,'answer_count':0,'known_count':0}]
+    calls=[]
+    def choose(population,weights,k):
+        calls.append((population,weights))
+        return [population[int(np.argmax(weights))]]
+    monkeypatch.setattr(study.random,'choices',choose)
+    assert study._choose_subtopic(large+small,'course',large+small)==small[0]
+    assert calls[0][0]==[1,2]
+    assert calls[0][1]==[study._priority(large),study._priority(small)]
+    # A topic's urgency includes all its subtopics, even while one is generating.
+    unavailable={'id':21,'topic_id':2,'size':5,'answer_count':5,'known_count':0}
+    calls.clear()
+    study._choose_subtopic(large+small,'course',large+small+[unavailable])
+    assert calls[0][1][1]==study._priority(small+[unavailable])
